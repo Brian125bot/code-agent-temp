@@ -1,557 +1,479 @@
-# Coding Agent Template
+# Jules-Style Async Agent (Vercel AI Gateway Edition)
 
-A template for building AI-powered coding agents that supports Claude Code, OpenAI's Codex CLI, GitHub Copilot CLI, Cursor CLI, Google Gemini CLI, and opencode with [Vercel Sandbox](https://vercel.com/docs/vercel-sandbox) to automatically execute coding tasks on your repositories.
+An analogue of **Jules** — the asynchronous coding agent — rebuilt from the Vercel Coding Agent Template to run on **Vercel Hobby (Free Tier)** with **Vercel AI Gateway** as the sole inference provider.
+
+Give it a repo + a task and it works **detached**: clones, branches, edits code inside a Vercel Sandbox VM, streams logs, pushes, and is wired for PR automation. No direct Anthropic/OpenAI/Gemini keys — every model call is routed through **AI Gateway** (`https://ai-gateway.vercel.sh`) with a single `AI_GATEWAY_API_KEY`.
 
 ![Coding Agent Template Screenshot](screenshot.png)
 
-## Deploy Your Own
+## Table of Contents
+- [What This Is](#what-this-is)
+- [How Jules-Style Async Works Here](#how-jules-style-async-works-here)
+- [Architecture](#architecture)
+- [Free-Tier Constraints (and How They Are Met)](#free-tier-constraints-and-how-they-are-met)
+- [Vercel AI Gateway — The Only Model Path](#vercel-ai-gateway--the-only-model-path)
+- [Deploy to Vercel (One Click)](#deploy-to-vercel-one-click)
+- [Local Development](#local-development)
+- [Configuration Reference](#configuration-reference)
+- [API Reference](#api-reference)
+- [GitHub Webhook — `/jules` Trigger](#github-webhook--jules-trigger)
+- [Cron Reaper](#cron-reaper)
+- [Task & Database Model](#task--database-model)
+- [Security](#security)
+- [Development Scripts](#development-scripts)
+- [Project Structure](#project-structure)
+- [Troubleshooting](#troubleshooting)
+- [License](#license)
 
-You can deploy your own version of the coding agent template to Vercel with one click:
+## What This Is
+
+This repo is a **mutation**, not a rewrite, of [`vercel-labs/coding-agent-template`](https://github.com/vercel-labs/coding-agent-template):
+
+- **Before**: `POST /api/tasks` held a serverless function open with `after()` + 6 agents (Claude, Codex, Copilot, Cursor, Gemini, opencode) each requiring its own provider key, and `vercel.json` set `maxDuration: 300` (5 minutes — breaks Hobby's 10s limit).
+- **After**: `POST /api/tasks` returns `201` within **≤3.5s** (fallback branch/title synchronously, bounded 3.5s race for AI names). Heavy work lives **inside the Sandbox VM** (its own timeout, `vcpus: 2`, default `60m`), started via a second Hobby-safe `POST /api/tasks/[id]/start`. A single **Gateway agent** drives edits; Claude/Codex remain available **via Gateway**. All API routes are `maxDuration: 10`.
+
+If you came from the original template, see [What Changed](#what-changed-from-the-upstream-template) at the bottom for a diff.
+
+## How Jules-Style Async Works Here
+
+```
+[You / GitHub Webhook]
+        │  POST /api/tasks  { prompt, repoUrl, selectedAgent, selectedModel }
+        ▼
+   DB: tasks { status: "pending", branchName: fallback, title: fallback }
+        │  (bounded 3.5s AI branch/title race via Gateway; keeps Hobby limit)
+   201 { task }
+        │  client immediately calls POST /api/tasks/[id]/start
+        ▼
+   start route (Hobby, ≤10s): validates Gateway key + GitHub token
+        │  createSandbox()  →  Sandbox.create({ timeout: "60m", vcpus: 2, ports })
+        │    git clone --depth 1  →  checkout branch  →  optional install  →  optional dev server
+        │  registers sandboxId, flips task → status: "processing"
+        ▼  (function returns — no holding)
+[Sandbox VM — the Jules worker]
+        │  executeAgentInSandbox()  (gateway | claude | codex, all via AI_GATEWAY_API_KEY)
+        │    streams logs → tasks.logs (polling) and task_messages
+        │    edits files  →  pushChangesToBranch()  →  git push origin <branch>
+        ▼
+   tasks { status: "completed" | "error", prUrl/prNumber when created, sandboxUrl }
+        ▲
+        │  polling: GET /api/tasks/[id] every 5s (useTask), messages every 3s
+[Browser / GitHub]
+```
+
+**Jules delight kept**: repo picker in the header, per-task logs + file browser + diff + preview iframe + chat/continue, PR create/merge/close, sandbox terminal & LSP.
+
+## Architecture
+
+| Layer | Choice | Why |
+|------|--------|-----|
+| Compute | **Vercel Sandbox** (`@vercel/sandbox`) | Isolated VM that outlives the serverless function — perfect for Jules detached work. Free-tier trick: the function only *starts* the VM (<10s). |
+| Inference | **Vercel AI Gateway** (`ai` SDK `generateText` with `openai/gpt-5-nano`, `anthropic/...`) | Single key, model routing by string, no per-provider secrets. Branch/title/commit names and the native `gateway` agent all use it. |
+| Async | Two-phase `POST /api/tasks` → `POST /api/tasks/[id]/start` + polling + `GET /api/cron/reap` | Hobby has no Queues/Workflow. The VM is the queue; the cron is the reaper. |
+| DB | **Neon Postgres** + **Drizzle ORM** (`drizzle.config.ts`) | Provisioned automatically via the Vercel Deploy Button (`vercel-template.json`). |
+| Auth | **GitHub** and/or **Vercel OAuth** (`arctic` + `jose` JWE cookie) | Same as upstream — required for repo access. |
+| UI | Next.js 16, React 19, Tailwind, shadcn/ui | Unchanged. |
+
+### Request lifecycle (annotated)
+
+1. `TaskForm` validates (`prompt`, Gateway model) then `POST /api/tasks`.
+2. Server: rate-limit → `insertTaskSchema` → `db.insert(tasks)` with **fallback** `branchName`/`title` → **bounded** AI generation (`Promise.race(..., 3500ms)`) upgrades them in place if Gateway responds in time.
+3. Client receives `201 { task }` and immediately `POST /api/tasks/[id]/start`.
+4. `start` route creates the Sandbox, writes `sandboxId/sandboxUrl`, marks `processing`, and runs `runTaskAsync()` (in `lib/sandbox/orchestrator.ts`) — agent execution + `pushChangesToBranch` + `logger.updateStatus`.
+5. UI polls via `lib/hooks/use-task.ts` (5s tasks, 3s messages, 30s checks/deployments).
+6. `GET /api/cron/reap` (every 5m) visits `processing` tasks whose `updatedAt` is stale, probes the Sandbox, and recovers.
+
+## Free-Tier Constraints (and How They Are Met)
+
+Vercel Hobby limits are documented at `https://vercel.com/docs/functions/limitations`:
+
+- `maxDuration: 10` — every function in `vercel.json` is **10** (not 300). The original `300` would fail to deploy on Hobby.
+- No `after()`-forever: the old template used three `after()` continuations to generate branch/title and run `processTaskWithTimeout` (holding the function). This template removes `after()` from `/api/tasks` and runs heavy work inside the **Sandbox VM**, not the function.
+- Sandbox defaults lowered: `MAX_SANDBOX_DURATION` is now **60** (not 300) and `vcpus: 2` (not 4). Override with env `MAX_SANDBOX_DURATION`.
+- One cron only: `crons: [{ path: "/api/cron/reap", schedule: "*/5 * * * *" }]` — Hobby allows a single cron.
+
+## Vercel AI Gateway — The Only Model Path
+
+`lib/constants.ts` is the single source of truth:
+
+```ts
+export const GATEWAY_BASE_URL = 'https://ai-gateway.vercel.sh'
+export const GATEWAY_DEFAULT_MODEL = 'openai/gpt-5-nano'
+export const GATEWAY_MODELS = [
+  'openai/gpt-5',
+  'openai/gpt-5-mini',
+  'openai/gpt-5-nano',
+  'anthropic/claude-sonnet-4-5',
+  'anthropic/claude-haiku-4-5',
+  'google/gemini-2.5-pro',
+] as const
+```
+
+- Host code (`lib/utils/branch-name-generator.ts`, `title-generator.ts`, `commit-message-generator.ts`) uses `generateText({ model: 'openai/gpt-5-nano' })` via the SDK — routed through Gateway when `AI_GATEWAY_API_KEY` is set.
+- Claude CLI is configured with `ANTHROPIC_API_KEY=${AI_GATEWAY_API_KEY}` + `ANTHROPIC_BASE_URL=https://ai-gateway.vercel.sh` (`lib/sandbox/agents/claude.ts`).
+- Codex CLI writes `~/.codex/config.toml` with `model_provider = "vercel-ai-gateway"`, `base_url = "https://ai-gateway.vercel.sh/v1"` (`lib/sandbox/agents/codex.ts`).
+- The native `gateway` agent (`lib/sandbox/agents/gateway.ts`) is the recommended Jules brain: it uses the `ai` SDK + `generateText` with tools (`readFile`, `writeFile`, `runCommand`, `listFiles`) that execute **inside** the sandbox via `sandbox.runCommand` — no CLI install needed, fully Gateway-native.
+- User keys: only `AI_GATEWAY_API_KEY` is required (`keys.provider = 'aigateway'`). Legacy providers (`anthropic`, `openai`, `gemini`, `cursor`) still exist in `lib/db/schema.ts` but the UI hides them under "Legacy providers" and `lib/sandbox/config.ts` treats them as legacy gated by `ENABLE_LEGACY_AGENTS`.
+
+> **Key shape**: `AI_GATEWAY_API_KEY` accepts `vck_...` (Vercel-issued Gateway key) or `gw_...`.
+
+## Deploy to Vercel (One Click)
 
 [![Deploy with Vercel](https://vercel.com/button)](https://vercel.com/new/clone?repository-url=https%3A%2F%2Fgithub.com%2Fvercel-labs%2Fcoding-agent-template&env=SANDBOX_VERCEL_TEAM_ID,SANDBOX_VERCEL_PROJECT_ID,SANDBOX_VERCEL_TOKEN,JWE_SECRET,ENCRYPTION_KEY&envDescription=Required+environment+variables+for+the+coding+agent+template.+You+must+also+configure+at+least+one+OAuth+provider+(GitHub+or+Vercel)+after+deployment.+Optional+API+keys+can+be+added+later.&stores=%5B%7B%22type%22%3A%22postgres%22%7D%5D&project-name=coding-agent-template&repository-name=coding-agent-template)
 
-**What happens during deployment:**
-- **Automatic Database Setup**: A Neon Postgres database is automatically created and connected to your project
-- **Environment Configuration**: You'll be prompted to provide required environment variables (Vercel credentials and encryption keys)
-- **OAuth Setup**: After deployment, you'll need to configure at least one OAuth provider (GitHub or Vercel) in your project settings for user authentication
+What happens:
 
-## Features
+- A **Neon Postgres** is provisioned and `POSTGRES_URL` is set.
+- You are prompted for the required env vars (see below).
+- After deploy, configure **at least one OAuth provider** (GitHub or Vercel) in your Vercel project settings.
 
-- **Multi-Agent Support**: Choose from Claude Code, OpenAI Codex CLI, GitHub Copilot CLI, Cursor CLI, Google Gemini CLI, or opencode to execute coding tasks
-- **User Authentication**: Secure sign-in with GitHub or Vercel OAuth
-- **Multi-User Support**: Each user has their own tasks, API keys, and GitHub connection
-- **Vercel Sandbox**: Runs code in isolated, secure sandboxes ([docs](https://vercel.com/docs/vercel-sandbox))
-- **AI Gateway Integration**: Built for seamless integration with [Vercel AI Gateway](https://vercel.com/docs/ai-gateway) for model routing and observability
-- **AI-Generated Branch Names**: Automatically generates descriptive Git branch names using AI SDK 5 + AI Gateway
-- **Task Management**: Track task progress with real-time updates
-- **Persistent Storage**: Tasks stored in Neon Postgres database
-- **Git Integration**: Automatically creates branches and commits changes
-- **Modern UI**: Clean, responsive interface built with Next.js and Tailwind CSS
-- **MCP Server Support**: Connect MCP servers to Claude Code for extended capabilities (Claude only)
+## Local Development
 
-## Quick Start
-
-For detailed setup instructions, see the [Local Development Setup](#local-development-setup) section below.
-
-**TL;DR:**
-1. Click the "Deploy with Vercel" button above (automatic database setup!)
-2. Configure OAuth (GitHub or Vercel) in your project settings
-3. Users sign in and start creating tasks
-
-Or run locally:
 ```bash
-git clone https://github.com/vercel-labs/coding-agent-template.git
-cd coding-agent-template
+git clone <this-repo>
+cd <this-repo>
 pnpm install
-# Set up .env.local with required variables
+
+# create .env.local (see Configuration Reference)
 pnpm db:push
-pnpm dev
+pnpm dev   # http://localhost:3000
 ```
 
-## Usage
+`pnpm dev` runs `next dev --webpack`. Do **not** run multiple dev servers against the same port.
 
-1. **Sign In**: Authenticate with GitHub or Vercel
-2. **Create a Task**: Enter a repository URL and describe what you want the AI to do
-3. **Monitor Progress**: Watch real-time logs as the agent works
-4. **Review Results**: See the changes made and the branch created
-5. **Manage Tasks**: View all your tasks in the sidebar with status updates
+## Configuration Reference
 
-## Task Configuration
+### Required — App infrastructure (set once, by you)
 
-### Maximum Duration
+| Variable | Where used | How to get it |
+|----------|-----------|---------------|
+| `POSTGRES_URL` | `drizzle.config.ts`, `lib/db/client.ts`, `scripts/migrate-production.ts` | Auto-set on Vercel via Neon integration; locally, any Postgres URL |
+| `SANDBOX_VERCEL_TOKEN` | `lib/sandbox/creation.ts`, 12+ sandbox routes | Vercel Dashboard → your project → Settings → Tokens |
+| `SANDBOX_VERCEL_TEAM_ID` | Same as above | Vercel Dashboard → Team settings → General |
+| `SANDBOX_VERCEL_PROJECT_ID` | Same as above | Vercel Dashboard → Project → Settings → General (or `.vercel/project.json`) |
+| `JWE_SECRET` | `lib/jwe/encrypt.ts`, `lib/jwe/decrypt.ts` | `openssl rand -base64 32` |
+| `ENCRYPTION_KEY` | `lib/crypto.ts` | `openssl rand -hex 32` (32 bytes, hex) |
 
-The maximum duration setting controls how long the Vercel sandbox will stay alive from the moment it's created. You can select timeouts ranging from 5 minutes to 5 hours.
+### Required — Auth (at least one)
 
-- The sandbox is created at the start of the task
-- The timeout begins when the sandbox is created
-- All work (agent execution, dependency installation, etc.) happens within this timeframe
-- When the timeout is reached, the sandbox automatically expires
+| Variable | Meaning |
+|----------|---------|
+| `NEXT_PUBLIC_AUTH_PROVIDERS` | `"github"`, `"vercel"`, or `"github,vercel"` (default `github`) |
+| `NEXT_PUBLIC_GITHUB_CLIENT_ID` / `GITHUB_CLIENT_SECRET` | GitHub OAuth App; callback `https://<host>/api/auth/github/callback` |
+| `NEXT_PUBLIC_VERCEL_CLIENT_ID` / `VERCEL_CLIENT_SECRET` | Vercel OAuth integration; callback `https://<host>/api/auth/callback/vercel` |
 
-### Keep Alive Setting
+Create OAuth apps:
 
-The Keep Alive setting determines what happens to the sandbox after your task completes.
+- **GitHub**: https://github.com/settings/developers → New OAuth App → Authorization callback URL `http://localhost:3000/api/auth/github/callback` (and production URL).
+- **Vercel**: https://vercel.com/dashboard → Team → Integrations → Create; Redirect URL `http://localhost:3000/api/auth/callback/vercel`.
 
-#### Keep Alive OFF (Default)
+### AI — Gateway only
 
-When Keep Alive is disabled, the sandbox shuts down immediately after the task completes:
+| Variable | Meaning |
+|----------|---------|
+| `AI_GATEWAY_API_KEY` | Vercel AI Gateway key (`vck_...` or `gw_...`). Global fallback; **or** set per-user in the profile dialog (`keys.provider = 'aigateway'`, stored encrypted). Required for branch/title/commit generation and for every agent. |
 
-**Timeline:**
-1. Task starts and sandbox is created (e.g., with 1 hour timeout)
-2. Agent executes your task
-3. Task completes successfully (e.g., after 10 minutes)
-4. Changes are committed and pushed to the branch
-5. Sandbox immediately shuts down (destroys all processes and the environment)
-6. Task is marked as completed
+### Optional
 
-**Use Keep Alive OFF when:**
-- You're making one-time code changes that don't require iteration
-- You have simple tasks that work on the first try
-- You want to minimize resource usage and costs
-- You don't need to test or manually interact with the code after completion
+| Variable | Default | Meaning |
+|----------|---------|---------|
+| `MAX_SANDBOX_DURATION` | `60` | Minutes the Sandbox VM lives (`lib/constants.ts`). Original template defaulted to `300`; trimmed for Hobby. |
+| `MAX_MESSAGES_PER_DAY` | `5` | Tasks + follow-ups per user per day (`lib/utils/rate-limit.ts`). |
+| `NPM_TOKEN` | — | Private npm access inside sandboxes. |
+| `GITHUB_WEBHOOK_SECRET` | — | HMAC for `POST /api/webhooks/github` (`x-hub-signature-256`). If unset, signature verification is skipped (noisy; set it in prod). |
+| `WEBHOOK_DEFAULT_USER_ID` | — | User ID to attribute webhook-created tasks to when the webhook has no session. Required if you enable the `/jules` webhook without per-install user mapping. |
+| `INGEST_TOKEN` / `CRON_SECRET` | — | Bearer tokens for `POST /api/tasks/[id]/ingest-logs` and `GET /api/cron/reap` if you call them outside Vercel cron. |
+| `ENABLE_LEGACY_AGENTS` | — | Set to `1` to allow `copilot`/`cursor`/`gemini`/`opencode` in `lib/sandbox/agents/index.ts`. Default: blocked with a helpful error. |
 
-#### Keep Alive ON
+> `.env*` is gitignored. Never commit `.env.local`.
 
-When Keep Alive is enabled, the sandbox stays alive after task completion for the remaining duration:
+## API Reference
 
-**Timeline:**
-1. Task starts and sandbox is created (e.g., with 1 hour timeout)
-2. Agent executes your task
-3. Task completes successfully (e.g., after 10 minutes)
-4. Changes are committed and pushed to the branch
-5. Sandbox stays alive with all processes running
-6. You can send follow-up messages for 50 more minutes (until the 1 hour timeout expires)
-7. If the project has a dev server (e.g., `npm run dev`), it automatically starts in the background
-8. After the full timeout duration, the sandbox expires
+All task routes require **authentication** (`getServerSession()` via JWE cookie `_user_session_`). Tasks are scoped to `tasks.userId` with soft delete (`isNull(deletedAt)`).
 
-**Use Keep Alive ON when:**
-- You need to iterate on the code with follow-up messages
-- You want to test changes in the live sandbox environment
-- You anticipate needing to refine or fix issues
-- You want to manually run commands or inspect the environment after completion
-- You're developing a web application and want to see it running
+### Tasks
 
-#### Comparison
+| Method | Path | Description |
+|--------|------|-------------|
+| `GET` | `/api/tasks` | List your tasks (`deletedAt IS NULL`, newest first). |
+| `POST` | `/api/tasks` | Create a task. **Returns 201 in ≤3.5s** (Hobby-safe). Upgrades `branchName`/`title` in the background. Body: `insertTaskSchema` (see below). |
+| `DELETE` | `/api/tasks?action=completed,failed,stopped` | Hard-delete by status, scoped to `userId`. |
+| `GET` | `/api/tasks/[taskId]` | Fetch one task (authz `userId` + `isNull(deletedAt)`). |
+| `PATCH` | `/api/tasks/[taskId]` | Update task (`action: 'stop'` kills sandbox, etc.). |
+| `DELETE` | `/api/tasks/[taskId]` | Soft-delete (`deletedAt = now()`). |
+| `POST` | `/api/tasks/[taskId]/start` | **Hobby async start** — creates the Sandbox, streams `processing` logs, runs `runTaskAsync()` (agent → push → `completed`/`error`). Fire-and-forget; UI calls it immediately after `POST /api/tasks`. `maxDuration: 10`. |
+| `POST` | `/api/tasks/[taskId]/continue` | Follow-up (`{ message }`): inserts `task_messages` (`role: 'user'`), resumes Sandbox if `keepAlive && sandboxId`, re-runs the selected agent with history. |
+| `GET` | `/api/tasks/[taskId]/messages` | `task_messages` for the task (`ORDER BY createdAt`). |
 
-| Setting | Task completes in 10 min | Remaining sandbox time | Can send follow-ups? | Dev server starts? |
-|---------|-------------------------|------------------------|---------------------|-------------------|
-| Keep Alive ON | Sandbox stays alive | 50 minutes (until timeout) | Yes | Yes (if available) |
-| Keep Alive OFF | Sandbox shuts down | 0 minutes | No | No |
+#### `POST /api/tasks` body (`insertTaskSchema`)
 
-**Note:** The maximum duration timeout always takes precedence. If you set a 1-hour timeout, the sandbox will expire after 1 hour regardless of the Keep Alive setting. Keep Alive only determines whether the sandbox shuts down early (after task completion) or stays alive until the timeout.
+```ts
+{
+  id?: string               // optional; generated if absent (12-char nanoid)
+  prompt: string            // required — the Jules instruction
+  repoUrl?: string          // clone URL (https://github.com/owner/repo[.git])
+  selectedAgent?: 'gateway' | 'claude' | 'codex' | 'copilot' | 'cursor' | 'gemini' | 'opencode'
+                            // default 'gateway' (Gateway-only); legacy agents need ENABLE_LEGACY_AGENTS
+  selectedModel?: string    // e.g. openai/gpt-5-nano; falls back to DEFAULT_MODELS[agent]
+  gatewayModel?: string     // canonical Gateway model string (preferred over selectedModel for audit)
+  installDependencies?: boolean // default false
+  maxDuration?: number      // minutes; default MAX_SANDBOX_DURATION (60)
+  keepAlive?: boolean       // keep VM alive after completion for follow-ups
+  enableBrowser?: boolean   // install agent-browser + Chromium + skill file
+  mcpServerIds?: string[]
+  branchName?: string       // optional; fallback generated with nanoid hash
+  title?: string
+}
+```
 
-## How It Works
+Response `201 { task }` — the task row as stored (the `branchName`/`title` may be fallback initially and upgrade seconds later via Gateway).
 
-1. **Task Creation**: When you submit a task, it's stored in the database
-2. **AI Branch Name Generation**: AI SDK 5 + AI Gateway automatically generates a descriptive branch name based on your task (non-blocking using Next.js 15's `after()`)
-3. **Sandbox Setup**: A Vercel sandbox is created with your repository
-4. **Agent Execution**: Your chosen coding agent (Claude Code, Codex CLI, GitHub Copilot CLI, Cursor CLI, Gemini CLI, or opencode) analyzes your prompt and makes changes
-5. **Git Operations**: Changes are committed and pushed to the AI-generated branch
-6. **Cleanup**: The sandbox is shut down to free resources
+#### Task statuses
 
-## AI Branch Name Generation
+`pending` → `processing` → `completed` | `error` | `stopped` (with `progress 0-100`, `logs: LogEntry[]`, `error?`, `prUrl/prNumber/prStatus`, `sandboxId/sandboxUrl`, `agentSessionId`).
 
-The system automatically generates descriptive Git branch names using AI SDK 5 and Vercel AI Gateway. This feature:
+### Sandboxes
 
-- **Non-blocking**: Uses Next.js 15's `after()` function to generate names without delaying task creation
-- **Descriptive**: Creates meaningful branch names like `feature/user-authentication-A1b2C3` or `fix/memory-leak-parser-X9y8Z7`
-- **Conflict-free**: Adds a 6-character alphanumeric hash to prevent naming conflicts
-- **Fallback**: Gracefully falls back to timestamp-based names if AI generation fails
-- **Context-aware**: Uses task description, repository name, and agent context for better names
+| Method | Path | Description |
+|--------|------|-------------|
+| `GET` | `/api/sandboxes` | Your active sandboxes (`sandboxId IS NOT NULL`). |
+| `GET` | `/api/tasks/[taskId]/sandbox-health` | `sandbox.runCommand('pwd')` probe. |
+| `POST` | `/api/tasks/[taskId]/start-sandbox` | Recreate/attach to sandbox if it died. |
+| `POST` | `/api/tasks/[taskId]/stop-sandbox` | `killSandbox(taskId)` + `sandboxId = NULL`. |
+| `POST` | `/api/tasks/[taskId]/restart-dev` | Re-start `npm run dev` (detached + host fixup). |
+| `POST` | `/api/tasks/[taskId]/terminal` | `POST { command }` → `sandbox.runCommand('sh', ['-c', cmd])`. |
+| `POST` | `/api/tasks/[taskId]/ingest-logs` | Internal: `POST { logs: LogEntry[], progress?, status? }` — appends to `tasks.logs`. Authorized by `x-vercel-cron` or `Bearer $SANDBOX_VERCEL_TOKEN` / `Bearer $INGEST_TOKEN`. Not user-sessioned. |
 
-### Branch Name Examples
+### Files, diffs, PRs
 
-- `feature/add-user-auth-K3mP9n` (for "Add user authentication with JWT")
-- `fix/resolve-memory-leak-B7xQ2w` (for "Fix memory leak in image processing")
-- `chore/update-deps-M4nR8s` (for "Update all project dependencies")
-- `docs/api-endpoints-F9tL5v` (for "Document REST API endpoints")
+| Method | Path |
+|--------|------|
+| `GET` | `/api/tasks/[taskId]/files`, `/project-files`, `/file-content?filename&mode=local|remote`, `/diff?filename&mode=local`, `/sync-changes`, `/sync-pr`, `/clear-logs`, `/save-file`, `/create-file`, `/create-folder`, `/delete-file`, `/file-operation`, `/discard-file-changes`, `/reset-changes`, `/autocomplete`, `/lsp`, `/deployment`, `/check-runs` |
+| `GET/POST` | `/api/tasks/[taskId]/pr`, `/close-pr`, `/reopen-pr`, `/merge-pr`, `/pr-comments` |
 
-## Tech Stack
+All operate on `PROJECT_DIR = /vercel/sandbox/project` inside the VM, or on GitHub via Octokit + the user's decrypted GitHub token (`getUserGitHubToken()`).
 
-- **Frontend**: Next.js 15, React 19, Tailwind CSS
-- **UI Components**: shadcn/ui
-- **Database**: PostgreSQL with Drizzle ORM
-- **AI SDK**: AI SDK 5 with Vercel AI Gateway integration
-- **AI Agents**: Claude Code, OpenAI Codex CLI, GitHub Copilot CLI, Cursor CLI, Google Gemini CLI, opencode
-- **Sandbox**: [Vercel Sandbox](https://vercel.com/docs/vercel-sandbox)
-- **Authentication**: Next Auth (OAuth with GitHub/Vercel)
-- **Git**: Automated branching and commits with AI-generated branch names
+### Cron
 
-## MCP Server Support
+| Method | Path | Description |
+|--------|------|-------------|
+| `GET` | `/api/cron/reap` | **Hobby cron** (`*/5 * * * *`, `maxDuration: 10`). Queries `tasks WHERE status='processing' AND updatedAt < now()-5m` (limit 20), tries `Sandbox.get()`, probes liveness, logs `Reaper could not reach sandbox` if needed. Authorized by `x-vercel-cron` or `Bearer $CRON_SECRET` / `Bearer $SANDBOX_VERCEL_TOKEN`; always allowed in non-production for manual testing (`curl -H "x-vercel-cron: 1" ...`). |
 
-Connect MCP Servers to extend Claude Code with additional tools and integrations. **Currently only works with Claude Code agent.**
+### Webhooks
 
-### How to Add MCP Servers
+| Method | Path | Description |
+|--------|------|-------------|
+| `POST` | `/api/webhooks/github` | Jules trigger. Verifies `x-hub-signature-256` with `GITHUB_WEBHOOK_SECRET`, records `webhook_events`, extracts `prompt` from `issue.body` or `/jules <prompt>` in `issue_comment`, creates a DB `task` (`selectedAgent: 'gateway'`). Requires `WEBHOOK_DEFAULT_USER_ID` to attribute the task. `maxDuration: 10`. |
 
-1. Go to the "Connectors" tab and click "Add MCP Server"
-2. Enter server details (name, base URL, optional OAuth credentials)
-3. If using OAuth, ensure `ENCRYPTION_KEY` is set in your environment variables
+### Keys & Connectors
 
-**Note**: `ENCRYPTION_KEY` is required when using MCP servers with OAuth authentication.
+| Method | Path | Description |
+|--------|------|-------------|
+| `GET/POST/DELETE` | `/api/api-keys` | CRUD `keys` (`provider: 'aigateway'|'anthropic'|'openai'|'cursor'|'gemini'`, encrypted via `lib/crypto.ts`). UI emphasizes Gateway. |
+| `GET` | `/api/api-keys/check?agent=&model=` | Returns `{ hasKey, provider, agentName }` — now Gateway-centric (all agents route through `aigateway` unless `copilot` with `getUserGitHubToken()`). |
+| `GET/POST/DELETE` | `/api/connectors` | MCP servers for Claude (`local`/`remote`, encrypted `env`/`oauthClientSecret`). |
+| `GET` | `/api/auth/*`, `/api/github/*`, `/api/vercel/teams`, `/api/github-stars` | OAuth, GitHub proxies, team picker, cached stars. |
 
-## Local Development Setup
+## GitHub Webhook — `/jules` Trigger
 
-### 1. Clone the repository
+Wire a GitHub App or repo webhook to `https://<your-app>.vercel.app/api/webhooks/github`:
+
+- Secret → `GITHUB_WEBHOOK_SECRET`
+- Events → `Issues`, `Issue comments`
+- Payload URL → that path; content type `application/json`.
+
+Behavior:
+
+- On `issues.opened` → `prompt = issue.body`.
+- On `issue_comment.created` containing `/jules <prompt>` → `prompt = <prompt>`.
+- If no prompt or no repo, the event is recorded in `webhook_events` and ignored (`{ ok: true, ignored: true }`).
+- If `WEBHOOK_DEFAULT_USER_ID` is unset, the handler returns `500` (configure it to a real user to attribute webhook tasks).
+- On success: `201 { task }` with `branchName` fallback and `webhookSource: { event, deliveryId }`.
+
+Manual test:
 
 ```bash
-git clone https://github.com/vercel-labs/coding-agent-template.git
-cd coding-agent-template
+curl -X POST https://<host>/api/webhooks/github \
+  -H "X-GitHub-Event: issues" \
+  -H "Content-Type: application/json" \
+  -d '{"action":"opened","repository":{"html_url":"https://github.com/owner/repo"},"issue":{"body":"Fix the flaky parser test"},"sender":{"login":"octocat"}}'
 ```
 
-### 2. Install dependencies
+Add ` -H "X-Hub-Signature-256: sha256=..."` when `GITHUB_WEBHOOK_SECRET` is set.
+
+## Cron Reaper
+
+Defined in `vercel.json`:
+
+```json
+{ "crons": [{ "path": "/api/cron/reap", "schedule": "*/5 * * * *" }] }
+```
+
+- Queries stale `processing` tasks (`updatedAt < now()-5m`, limit 20).
+- For each `sandboxId`, calls `Sandbox.get({ sandboxId, teamId, projectId, token })`, then `sandbox.runCommand('sh', ['-c', 'ps aux | head ...; git status --porcelain'])`.
+- If the VM is gone, logs `Reaper could not reach sandbox` via `createTaskLogger` (no data leak — static string).
+- Update this handler as you add richer healing (e.g., re-queue, timeout → `error`, auto-PR).
+
+Trigger manually in dev:
 
 ```bash
-pnpm install
+curl -H "x-vercel-cron: 1" http://localhost:3000/api/cron/reap
 ```
 
-### 3. Set up environment variables
+## Task & Database Model
 
-Create a `.env.local` file with your values:
+### `tasks`
 
-#### Required Environment Variables (App Infrastructure)
+```
+id PK
+userId FK → users.id (CASCADE)
+prompt, title?, repoUrl?
+selectedAgent  default 'gateway'   // was 'claude'
+selectedModel?                    // agent-specific label (e.g. claude-sonnet-4-5)
+gatewayModel?                     // canonical Gateway model string (new)
+installDependencies?  default false
+maxDuration       default 60      // was 300 (MAX_SANDBOX_DURATION)
+keepAlive?, enableBrowser?
+status  'pending'|'processing'|'completed'|'error'|'stopped' default 'pending'
+progress 0-100, logs jsonb LogEntry[], error?
+branchName?, sandboxId?, agentSessionId?, sandboxUrl?, previewUrl?
+prUrl?, prNumber?, prStatus? 'open'|'closed'|'merged', prMergeCommitSha?
+mcpServerIds? jsonb string[]
+webhookSource? jsonb  {}          // new — event/deliveryId
+ingestCursor? timestamp           // new — last ingest write
+createdAt, updatedAt, completedAt?, deletedAt? (soft delete)
+```
 
-These are set once by you (the app developer) and are used for core infrastructure:
+`webhook_events` (new) records every incoming webhook plus the task it spawned:
 
-- `POSTGRES_URL`: Your PostgreSQL connection string (automatically provided when deploying to Vercel via the Neon integration, or set manually for local development)
-- `SANDBOX_VERCEL_TOKEN`: Your Vercel API token (for creating sandboxes)
-- `SANDBOX_VERCEL_TEAM_ID`: Your Vercel team ID (for sandbox creation)
-- `SANDBOX_VERCEL_PROJECT_ID`: Your Vercel project ID (for sandbox creation)
-- `JWE_SECRET`: Base64-encoded secret for session encryption (generate with: `openssl rand -base64 32`)
-- `ENCRYPTION_KEY`: 32-byte hex string for encrypting user API keys and tokens (generate with: `openssl rand -hex 32`)
+```
+id PK, provider, eventType, payload jsonb, taskId FK → tasks.id (SET NULL), createdAt
+```
 
-> **Note**: When deploying to Vercel using the "Deploy with Vercel" button, the database is automatically provisioned via Neon and `POSTGRES_URL` is set for you. For local development, you'll need to provide your own database connection string.
+Other tables unchanged: `users` (`UNIQUE(provider, externalId)`), `accounts` (linked GitHub for Vercel users, `UNIQUE(userId, provider)`), `keys` (`UNIQUE(userId, provider)` with `enum ['anthropic','openai','cursor','gemini','aigateway']`), `task_messages` (`taskId FK CASCADE`, `role 'user'|'agent'`), `connectors`, `settings`.
 
-#### User Authentication (Required)
+Migrations live in `lib/db/migrations/` and are tracked in `lib/db/migrations/meta/_journal.json`. The Jules changes are in `0022_swift_black_crow.sql` (generated via `pnpm db:generate`; run via `pnpm db:push`).
 
-**You must configure at least one authentication method** (Vercel or GitHub):
+## Security
 
-##### Configure Enabled Providers
+This template ships with strict rules documented at the top of `AGENTS.md` — **follow them**:
 
-- `NEXT_PUBLIC_AUTH_PROVIDERS`: Comma-separated list of enabled auth providers
-  - `"github"` - GitHub only (default)
-  - `"vercel"` - Vercel only
-  - `"github,vercel"` - Both providers enabled
+- **All log statements use static strings only — never template literals with `${}`**. Example:
 
-**Examples:**
+  ```ts
+  // BAD: await logger.info(`Task created: ${taskId}`)
+  // GOOD: await logger.info('Task created')
+  ```
+
+  Logs are displayed in the UI and returned in API responses — dynamic values leak IDs, paths, and credentials.
+
+- `lib/utils/logging.ts:redactSensitiveInfo()` is a **backup** only (API keys, Bearer tokens, GitHub tokens, `teamId`/`projectId`/`Vercel` fields) — the primary defense is not logging dynamic values.
+- Sensitive env vars **must not** reach the client. Only `NEXT_PUBLIC_GITHUB_CLIENT_ID`, `NEXT_PUBLIC_VERCEL_CLIENT_ID`, `NEXT_PUBLIC_AUTH_PROVIDERS` are client-safe. Everything else (`SANDBOX_VERCEL_*`, `AI_GATEWAY_API_KEY`, `JWE_SECRET`, `ENCRYPTION_KEY`, `GITHUB_WEBHOOK_SECRET`, user tokens/keys) stays server-side and is encrypted at rest with `ENCRYPTION_KEY`/`JWE_SECRET` (`lib/crypto.ts`, `lib/jwe/*`).
+- Search for violations before submitting:
+
+  ```bash
+  grep -r "logger\.(info|error|success|command)(\`.*\${" --include="*.ts" lib/ app/
+  grep -r "console\.(log|error|warn|info)(\`.*\${" --include="*.ts" lib/ app/
+  ```
+
+## Development Scripts
 
 ```bash
-# GitHub authentication only (default)
-NEXT_PUBLIC_AUTH_PROVIDERS=github
-
-# Vercel authentication only
-NEXT_PUBLIC_AUTH_PROVIDERS=vercel
-
-# Both GitHub and Vercel authentication
-NEXT_PUBLIC_AUTH_PROVIDERS=github,vercel
+pnpm dev            # next dev --webpack (http://localhost:3000)
+pnpm build          # next build --turbopack
+pnpm start          # next start
+pnpm lint           # eslint
+pnpm type-check     # tsc --noEmit
+pnpm format         # prettier --write "**/*.{ts,tsx}"
+pnpm format:check   # prettier --check "**/*.{ts,tsx}"
+pnpm db:generate    # drizzle-kit generate  (writes lib/db/migrations/*.sql)
+pnpm db:push        # drizzle-kit push      (applies migrations)
+pnpm db:migrate     # drizzle-kit migrate
+pnpm db:studio      # drizzle studio
 ```
 
-##### Provider Configuration
+Compliance checklist before a PR (from `AGENTS.md`):
 
-**Option 1: Sign in with Vercel** (if `vercel` is in `NEXT_PUBLIC_AUTH_PROVIDERS`)
-- `NEXT_PUBLIC_VERCEL_CLIENT_ID`: Your Vercel OAuth app client ID (exposed to client)
-- `VERCEL_CLIENT_SECRET`: Your Vercel OAuth app client secret
+- [ ] No `${}` in any `logger.*` / `console.*` user-facing log calls
+- [ ] `pnpm format` + `pnpm format:check` pass
+- [ ] `pnpm type-check` pass
+- [ ] `pnpm lint` pass
+- [ ] `pnpm build` pass
+- [ ] `vercel.json` still `maxDuration: 10` on every function
 
-**Option 2: Sign in with GitHub** (if `github` is in `NEXT_PUBLIC_AUTH_PROVIDERS`)
-- `NEXT_PUBLIC_GITHUB_CLIENT_ID`: Your GitHub OAuth app client ID (exposed to client)
-- `GITHUB_CLIENT_SECRET`: Your GitHub OAuth app client secret
+## Project Structure
 
-> **Note**: Only the providers listed in `NEXT_PUBLIC_AUTH_PROVIDERS` will appear in the sign-in dialog. You must provide the OAuth credentials for each enabled provider.
-
-#### API Keys (Optional - Can be per-user)
-
-These API keys can be set globally (fallback for all users) or left unset to require users to provide their own:
-
-- `ANTHROPIC_API_KEY`: Anthropic API key for Claude agent (users can override in their profile)
-- `AI_GATEWAY_API_KEY`: AI Gateway API key for branch name generation and Codex (users can override)
-- `CURSOR_API_KEY`: For Cursor agent support (users can override)
-- `GEMINI_API_KEY`: For Google Gemini agent support (users can override)
-- `OPENAI_API_KEY`: For Codex and OpenCode agents (users can override)
-
-> **Note**: Users can provide their own API keys in their profile settings, which take precedence over global environment variables.
-
-#### GitHub Repository Access
-
-- ~~`GITHUB_TOKEN`~~: **No longer needed!** Users authenticate with their own GitHub accounts.
-  - Users who sign in with GitHub automatically get repository access via their OAuth token
-  - Users who sign in with Vercel can connect their GitHub account from their profile to access repositories
-
-**How Authentication Works:**
-- **Sign in with GitHub**: Users get immediate repository access via their GitHub OAuth token
-- **Sign in with Vercel**: Users must connect a GitHub account from their profile to work with repositories
-- **Identity Merging**: If a user signs in with Vercel, connects GitHub, then later signs in directly with GitHub, they'll be recognized as the same user (no duplicate accounts)
-
-#### Optional Environment Variables
-
-- `NPM_TOKEN`: For private npm packages
-- `MAX_SANDBOX_DURATION`: Default maximum sandbox duration in minutes (default: `300` = 5 hours)
-- `MAX_MESSAGES_PER_DAY`: Maximum number of tasks + follow-ups per user per day (default: `5`)
-
-### 4. Set up OAuth Applications
-
-Based on your `NEXT_PUBLIC_AUTH_PROVIDERS` configuration, you'll need to create OAuth apps:
-
-#### GitHub OAuth App (if using GitHub authentication)
-
-1. Go to [GitHub Developer Settings](https://github.com/settings/developers)
-2. Click "New OAuth App"
-3. Fill in the details:
-   - **Application name**: Your app name (e.g., "My Coding Agent")
-   - **Homepage URL**: `http://localhost:3000` (or your production URL)
-   - **Authorization callback URL**: `http://localhost:3000/api/auth/github/callback`
-4. Click "Register application"
-5. Copy the **Client ID** → use for `NEXT_PUBLIC_GITHUB_CLIENT_ID`
-6. Click "Generate a new client secret" → copy and use for `GITHUB_CLIENT_SECRET`
-
-**Required Scopes**: The app will request `repo` scope to access repositories.
-
-#### Vercel OAuth App (if using Vercel authentication)
-
-1. Go to your [Vercel Dashboard](https://vercel.com/dashboard)
-2. Navigate to Settings → Integrations → Create
-3. Configure the integration:
-   - **Redirect URL**: `http://localhost:3000/api/auth/callback/vercel`
-4. Copy the **Client ID** → use for `NEXT_PUBLIC_VERCEL_CLIENT_ID`
-5. Copy the **Client Secret** → use for `VERCEL_CLIENT_SECRET`
-
-> **Production Deployment**: Remember to add production callback URLs when deploying (e.g., `https://yourdomain.com/api/auth/github/callback`)
-
-### 5. Set up the database
-
-Generate and run database migrations:
-
-```bash
-pnpm db:generate
-pnpm db:push
+```
+app/
+  layout.tsx, page.tsx
+  api/
+    tasks/route.ts                      # GET/POST/DELETE — POST returns 201 in ≤3.5s
+    tasks/[taskId]/route.ts             # GET/PATCH/DELETE (single task)
+    tasks/[taskId]/start/route.ts       # Hobby async start (new)
+    tasks/[taskId]/ingest-logs/route.ts # internal log ingestion (new)
+    tasks/[taskId]/continue/route.ts    # follow-up (resumes VM if keepAlive)
+    tasks/[taskId]/messages/route.ts
+    tasks/[taskId]/{files,project-files,file-content,save-file,create-file,create-folder,delete-file,file-operation,discard-file-changes,diff,sync-changes,sync-pr,reset-changes,clear-logs,terminal,lsp,autocomplete,deployment,check-runs,pr,sandbox-health,start-sandbox,stop-sandbox,restart-dev}/
+    cron/reap/route.ts                  # Hobby cron (new)
+    webhooks/github/route.ts            # /jules trigger (new)
+    api-keys/{route.ts,check/route.ts}  # Gateway-centric
+    connectors/route.ts, github/*, vercel/teams, auth/*
+  repos/[owner]/[repo]/, new/[owner]/[repo]/, tasks/[taskId]/,
+components/
+  task-form.tsx        # Gateway-only model matrix (gateway/claude/codex via Gateway)
+  api-keys-dialog.tsx  # Gateway required, legacy providers collapsed
+  home-page-content.tsx# calls /start immediately after /tasks
+  task-details.tsx, task-chat.tsx, logs-pane.tsx, file-browser.tsx, ...
+  connectors/, auth/, ui/, logos/, icons/
+lib/
+  constants.ts         # GATEWAY_BASE_URL, GATEWAY_DEFAULT_MODEL, GATEWAY_MODELS
+  db/schema.ts         # tasks (+gatewayModel, webhookSource, ingestCursor), webhook_events
+  db/client.ts, db/migrations/, db/users.ts, db/settings.ts
+  sandbox/
+    creation.ts        # Sandbox.create({ vcpus:2, timeout, clone, deps, branch })
+    orchestrator.ts    # runTaskAsync() — agent → pushChangesToBranch → status
+    agents/
+      index.ts         # AgentType gateway|claude|codex (+legacy gated)
+      gateway.ts       # native Gateway agent (ai SDK + sandbox tools) — new
+      claude.ts        # ANTHROPIC_BASE_URL=https://ai-gateway.vercel.sh
+      codex.ts         # vercel-ai-gateway in ~/.codex/config.toml
+      cursor.ts, copilot.ts, gemini.ts, opencode.ts # legacy (ENABLE_LEGACY_AGENTS)
+    commands.ts, git.ts, package-manager.ts, port-detection.ts, sandbox-registry.ts, config.ts, types.ts
+  utils/
+    branch-name-generator.ts, title-generator.ts, commit-message-generator.ts # generateText('openai/gpt-5-nano') via Gateway
+    task-logger.ts, logging.ts, rate-limit.ts, cookies.ts, id.ts
+  session/, jwe/, crypto.ts, github/, vercel-client/, api-keys/, atoms/, hooks/
+public/, scripts/, opensrc/
 ```
 
-### 6. Start the development server
-
-```bash
-pnpm dev
-```
-
-Open [http://localhost:3000](http://localhost:3000) in your browser.
-
-## Development
-
-### Database Operations
-
-```bash
-# Generate migrations
-pnpm db:generate
-
-# Push schema changes
-pnpm db:push
-
-# Open Drizzle Studio
-pnpm db:studio
-```
-
-### Running the App
-
-```bash
-# Development
-pnpm dev
-
-# Build for production
-pnpm build
-
-# Start production server
-pnpm start
-```
-
-## Contributing
-
-1. Fork the repository
-2. Create a feature branch
-3. Make your changes
-4. Test thoroughly
-5. Submit a pull request
-
-## Security Considerations
-
-- **Environment Variables**: Never commit `.env` files to version control. All sensitive data should be stored in environment variables.
-- **API Keys**: Rotate your API keys regularly and use the principle of least privilege.
-- **Database Access**: Ensure your PostgreSQL database is properly secured with strong credentials.
-- **Vercel Sandbox**: Sandboxes are isolated but ensure you're not exposing sensitive data in logs or outputs.
-- **User Authentication**: Each user uses their own GitHub token for repository access - no shared credentials
-- **Encryption**: All sensitive data (tokens, API keys) is encrypted at rest using per-user encryption
-
-## Changelog
-
-### Version 2.0.0 - Major Update: User Authentication & Security
-
-This release introduces **user authentication** and **major security improvements**, but contains **breaking changes** that require migration for existing deployments.
-
-#### New Features
-
-- **User Authentication System**
-  - Sign in with Vercel
-  - Sign in with GitHub
-  - Session management with encrypted tokens
-  - User profile management
-
-- **Multi-User Support**
-  - Each user has their own tasks and connectors
-  - Users can manage their own API keys (Anthropic, OpenAI, Cursor, Gemini, AI Gateway)
-  - GitHub account connection for repository access
-
-- **Security Enhancements**
-  - Per-user GitHub authentication - each user uses their own GitHub token instead of shared credentials
-  - All sensitive data (tokens, API keys, env vars) encrypted at rest
-  - Session-based authentication with JWT encryption
-  - User-scoped authorization - users can only access their own resources
-
-- **Database Enhancements**
-  - New `users` table for user profiles and OAuth accounts
-  - New `accounts` table for linked accounts (e.g., Vercel users connecting GitHub)
-  - New `keys` table for user-provided API keys
-  - Foreign key relationships ensure data integrity
-  - Soft delete support for tasks
-
-#### Breaking Changes
-
-**These changes require action if upgrading from v1.x:**
-
-1. **Database Schema Changes**
-   - `tasks` table now requires `userId` (foreign key to `users.id`)
-   - `connectors` table now requires `userId` (foreign key to `users.id`)
-   - `connectors.env` changed from `jsonb` to encrypted `text`
-   - Added `tasks.deletedAt` for soft deletes
-
-2. **API Changes**
-   - All API endpoints now require authentication
-   - Task creation requires `userId` in request body
-   - Tasks are now filtered by user ownership
-   - GitHub API access uses user's own GitHub token (no shared token fallback)
-
-3. **Environment Variables**
-   - **New Required Variables:**
-     - `JWE_SECRET`: Base64-encoded secret for session encryption (generate: `openssl rand -base64 32`)
-     - `ENCRYPTION_KEY`: 32-byte hex string for encrypting sensitive data (generate: `openssl rand -hex 32`)
-     - `NEXT_PUBLIC_AUTH_PROVIDERS`: Configure which auth providers to enable (`github`, `vercel`, or both)
-   
-   - **New OAuth Configuration (at least one required):**
-     - GitHub: `NEXT_PUBLIC_GITHUB_CLIENT_ID`, `GITHUB_CLIENT_SECRET`
-     - Vercel: `NEXT_PUBLIC_VERCEL_CLIENT_ID`, `VERCEL_CLIENT_SECRET`
-   
-   - **Changed Authentication:**
-     - `GITHUB_TOKEN` no longer used as fallback in API routes
-     - Users must connect their own GitHub account for repository access
-     - Each user's GitHub token is used for their requests
-
-4. **Authentication Required**
-   - All routes now require user authentication
-   - No anonymous access to tasks or API endpoints
-   - Users must sign in with GitHub or Vercel before creating tasks
-
-#### Migration Guide for Existing Deployments
-
-If you're upgrading from v1.x to v2.0.0, follow these steps:
-
-##### Step 1: Backup Your Database
-
-```bash
-# Create a backup of your existing database
-pg_dump $POSTGRES_URL > backup-before-v2-migration.sql
-```
-
-##### Step 2: Add Required Environment Variables
-
-Add these new variables to your `.env.local` or Vercel project settings:
-
-```bash
-# Session encryption (REQUIRED)
-JWE_SECRET=$(openssl rand -base64 32)
-ENCRYPTION_KEY=$(openssl rand -hex 32)
-
-# Configure auth providers (REQUIRED - choose at least one)
-NEXT_PUBLIC_AUTH_PROVIDERS=github  # or "vercel" or "github,vercel"
-
-# GitHub OAuth (if using GitHub authentication)
-NEXT_PUBLIC_GITHUB_CLIENT_ID=your_github_client_id
-GITHUB_CLIENT_SECRET=your_github_client_secret
-
-# Vercel OAuth (if using Vercel authentication)
-NEXT_PUBLIC_VERCEL_CLIENT_ID=your_vercel_client_id
-VERCEL_CLIENT_SECRET=your_vercel_client_secret
-```
-
-##### Step 3: Set Up OAuth Applications
-
-Create OAuth applications for your chosen authentication provider(s). See the [Local Development Setup](#local-development-setup) section for detailed instructions.
-
-##### Step 4: Prepare Database Migration
-
-Before running migrations, you need to handle existing data:
-
-**Option A: Fresh Start (Recommended for Development)**
-
-If you don't have production data to preserve:
-
-```bash
-# Drop existing tables and start fresh
-pnpm db:push --force
-
-# This will create all new tables with proper structure
-```
-
-**Option B: Preserve Existing Data (Production)**
-
-If you have existing tasks/connectors to preserve:
-
-1. **Create a system user first:**
-
-```sql
--- Connect to your database and run:
-INSERT INTO users (id, provider, external_id, access_token, username, email, created_at, updated_at, last_login_at)
-VALUES (
-  'system-user-migration',
-  'github',
-  'system-migration',
-  'encrypted-placeholder-token',  -- You'll need to encrypt a placeholder
-  'System Migration User',
-  NULL,
-  NOW(),
-  NOW(),
-  NOW()
-);
-```
-
-2. **Update existing records:**
-
-```sql
--- Add userId to existing tasks
-ALTER TABLE tasks ADD COLUMN user_id TEXT;
-UPDATE tasks SET user_id = 'system-user-migration' WHERE user_id IS NULL;
-ALTER TABLE tasks ALTER COLUMN user_id SET NOT NULL;
-ALTER TABLE tasks ADD CONSTRAINT tasks_user_id_fkey FOREIGN KEY (user_id) REFERENCES users(id) ON DELETE CASCADE;
-
--- Add userId to existing connectors
-ALTER TABLE connectors ADD COLUMN user_id TEXT;
-UPDATE connectors SET user_id = 'system-user-migration' WHERE user_id IS NULL;
-ALTER TABLE connectors ALTER COLUMN user_id SET NOT NULL;
-ALTER TABLE connectors ADD CONSTRAINT connectors_user_id_fkey FOREIGN KEY (user_id) REFERENCES users(id) ON DELETE CASCADE;
-
--- Convert connector env from jsonb to encrypted text (requires app-level encryption)
--- Note: You'll need to manually encrypt existing env values using your ENCRYPTION_KEY
-```
-
-3. **Run the standard migrations:**
-
-```bash
-pnpm db:generate
-pnpm db:push
-```
-
-##### Step 5: Update Your Code
-
-Pull the latest changes:
-
-```bash
-git pull origin main
-pnpm install
-```
-
-##### Step 6: Test Authentication
-
-1. Start the development server: `pnpm dev`
-2. Navigate to `http://localhost:3000`
-3. Sign in with your configured OAuth provider
-4. Verify you can create and view tasks
-
-##### Step 7: Verify Security Fix
-
-Confirm that:
-- Users can only see their own tasks
-- File diff/files endpoints require GitHub connection
-- Users without GitHub connection see "GitHub authentication required" errors
-- No `GITHUB_TOKEN` fallback is being used in API routes
-
-#### Important Notes
-
-- **All users will need to sign in** after this upgrade - no anonymous access
-- **Existing tasks** will be owned by the system user if using Option B migration
-- **Users must connect GitHub** (if they signed in with Vercel) to access repositories
-- **API keys** can now be per-user - users can override global API keys in their profile
-- **Breaking API changes**: If you have external integrations calling your API, they'll need to be updated to include authentication
-
+## Troubleshooting
+
+- **`AI_GATEWAY_API_KEY is required`** — set it globally (`AI_GATEWAY_API_KEY=vck_...`) or per-user in the profile API Keys dialog (Gateway). Without it, branch/title/commit fall back to timestamps, then to agent failure (correct — every inference path requires Gateway).
+- **Bonded 10s timeout on `/start`** — `POST /api/tasks/[taskId]/start` is capped at 10s. It creates the Sandbox and spawns the agent, then returns immediately; agent execution continues inside the VM. Do not re-introduce `after()`-forever in this path.
+- **Private repo clone fails** — ensure the user connected GitHub (`POST /api/auth/signin/github` or profile Connect) so `getUserGitHubToken()` can supply an authenticated clone URL.
+- **Vite preview blocked** — `creation.ts` sets `vite.config.* → host: true` and adds it to `~/.gitignore_global`.
+- **DB drift** — run `pnpm db:generate` then `pnpm db:push`. Never hand-edit tables outside Drizzle.
+
+## What Changed from the Upstream Template
+
+| Area | Upstream | This fork |
+|------|----------|-----------|
+| Inference | 6 provider matrix (Anthropic/OpenAI/Cursor/Gemini/Bearer×keys) | Gateway-only (`AI_GATEWAY_API_KEY` → `https://ai-gateway.vercel.sh`); Claude & Codex routed via `ANTHROPIC_BASE_URL` / `model_provider=vercel-ai-gateway`; new native `gateway` agent |
+| Task creation | `after()` x3 (branch/title + `processTaskWithTimeout` `Promise.race(timeout)`) — holds `maxDuration: 300` function | Bounded sync: fallback branch/title immediately + `Promise.race(..., 3500ms)` upgrade; no `after()`; ≤3.5s `201` |
+| Execution | `processTask` / `continueTask` inside `after()` | `lib/sandbox/orchestrator.ts:runTaskAsync()` + `POST /api/tasks/[id]/start` (Hobby `10s`) and `POST /api/tasks/[id]/continue` (existing flow preserved) |
+| Sandbox | `vcpus: 4`, `MAX_SANDBOX_DURATION 300` | `vcpus: 2`, `MAX_SANDBOX_DURATION 60` (plus `lib/constants.ts:GATEWAY_*`) |
+| Vercel | `vercel.json { maxDuration: 300, crons: [] }` | `{ maxDuration: 10 (×4 routes), crons: [{ path: "/api/cron/reap", schedule: "*/5 * * * *" }] }` |
+| DB | `tasks: { selectedAgent default 'claude', maxDuration default 300 }` | `+gatewayModel, +webhookSource, +ingestCursor`, default `gateway`/`60`, new `webhook_events` (migration `0022_swift_black_crow`) |
+| UI | 6 agents + per-provider key checks | Gateway-only picker (`gateway`/`claude`/`codex` all via Gateway), single Gateway key input, auto-`POST /start` |
+| New routes | — | `POST /api/tasks/[id]/start`, `POST /api/tasks/[id]/ingest-logs`, `GET /api/cron/reap`, `POST /api/webhooks/github` |
+
+## License
+
+MIT — see `LICENSE`.
+
+## Need Help?
+
+- Vercel Sandbox docs: https://vercel.com/docs/vercel-sandbox
+- Vercel AI Gateway: https://vercel.com/docs/ai-gateway
+- Drizzle ORM: https://orm.drizzle.team/
+- Next.js 16: https://nextjs.org/docs

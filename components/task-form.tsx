@@ -61,16 +61,20 @@ interface TaskFormProps {
 const CODING_AGENTS = [
   { value: 'multi-agent', label: 'Compare', icon: Users, isLogo: false },
   { value: 'divider', label: '', icon: () => null, isLogo: false, isDivider: true },
-  { value: 'claude', label: 'Claude', icon: Claude, isLogo: true },
-  { value: 'codex', label: 'Codex', icon: Codex, isLogo: true },
-  { value: 'copilot', label: 'Copilot', icon: Copilot, isLogo: true },
-  { value: 'cursor', label: 'Cursor', icon: Cursor, isLogo: true },
-  { value: 'gemini', label: 'Gemini', icon: Gemini, isLogo: true },
-  { value: 'opencode', label: 'opencode', icon: OpenCode, isLogo: true },
+  { value: 'gateway', label: 'Gateway', icon: Claude, isLogo: true },
+  { value: 'claude', label: 'Claude (Gateway)', icon: Claude, isLogo: true },
+  { value: 'codex', label: 'Codex (Gateway)', icon: Codex, isLogo: true },
 ] as const
 
-// Model options for each agent
 const AGENT_MODELS = {
+  gateway: [
+    { value: 'openai/gpt-5', label: 'GPT-5' },
+    { value: 'openai/gpt-5-mini', label: 'GPT-5 mini' },
+    { value: 'openai/gpt-5-nano', label: 'GPT-5 nano' },
+    { value: 'anthropic/claude-sonnet-4-5', label: 'Sonnet 4.5' },
+    { value: 'anthropic/claude-haiku-4-5', label: 'Haiku 4.5' },
+    { value: 'google/gemini-2.5-pro', label: 'Gemini 2.5 Pro' },
+  ],
   claude: [
     { value: 'claude-sonnet-4-5', label: 'Sonnet 4.5' },
     { value: 'anthropic/claude-opus-4.6', label: 'Opus 4.6' },
@@ -78,83 +82,18 @@ const AGENT_MODELS = {
   ],
   codex: [
     { value: 'openai/gpt-5.1', label: 'GPT-5.1' },
-    { value: 'openai/gpt-5.1-codex', label: 'GPT-5.1-Codex' },
-    { value: 'openai/gpt-5.1-codex-mini', label: 'GPT-5.1-Codex mini' },
-    { value: 'openai/gpt-5', label: 'GPT-5' },
-    { value: 'gpt-5-codex', label: 'GPT-5-Codex' },
-    { value: 'openai/gpt-5-mini', label: 'GPT-5 mini' },
+    { value: 'openai/gpt-5.1-codex', label: 'Codex 5.1' },
     { value: 'openai/gpt-5-nano', label: 'GPT-5 nano' },
-    { value: 'gpt-5-pro', label: 'GPT-5 pro' },
-    { value: 'openai/gpt-4.1', label: 'GPT-4.1' },
-  ],
-  copilot: [
-    { value: 'claude-sonnet-4.5', label: 'Sonnet 4.5' },
-    { value: 'claude-sonnet-4', label: 'Sonnet 4' },
-    { value: 'claude-haiku-4.5', label: 'Haiku 4.5' },
-    { value: 'gpt-5', label: 'GPT-5' },
-  ],
-  cursor: [
-    { value: 'auto', label: 'Auto' },
-    { value: 'composer-1', label: 'Composer' },
-    { value: 'sonnet-4.5', label: 'Sonnet 4.5' },
-    { value: 'sonnet-4.5-thinking', label: 'Sonnet 4.5 Thinking' },
-    { value: 'gpt-5', label: 'GPT-5' },
-    { value: 'gpt-5-codex', label: 'GPT-5 Codex' },
-    { value: 'opus-4.5', label: 'Opus 4.5' },
-    { value: 'opus-4.1', label: 'Opus 4.1' },
-    { value: 'grok', label: 'Grok' },
-  ],
-  gemini: [
-    { value: 'gemini-3-pro-preview', label: 'Gemini 3 Pro Preview' },
-    { value: 'gemini-2.5-pro', label: 'Gemini 2.5 Pro' },
-    { value: 'gemini-2.5-flash', label: 'Gemini 2.5 Flash' },
-  ],
-  opencode: [
-    { value: 'gpt-5', label: 'GPT-5' },
-    { value: 'gpt-5-mini', label: 'GPT-5 mini' },
-    { value: 'gpt-5-nano', label: 'GPT-5 nano' },
-    { value: 'gpt-4.1', label: 'GPT-4.1' },
-    { value: 'claude-sonnet-4-5', label: 'Sonnet 4.5' },
-    { value: 'claude-opus-4-5', label: 'Opus 4.5' },
-    { value: 'claude-haiku-4-5', label: 'Haiku 4.5' },
   ],
 } as const
 
-// Default models for each agent
 const DEFAULT_MODELS = {
+  gateway: 'openai/gpt-5-nano',
   claude: 'claude-sonnet-4-5',
   codex: 'openai/gpt-5.1',
-  copilot: 'claude-sonnet-4.5',
-  cursor: 'auto',
-  gemini: 'gemini-3-pro-preview',
-  opencode: 'gpt-5',
 } as const
 
-// API key requirements for each agent
-const AGENT_API_KEY_REQUIREMENTS: Record<string, Provider[]> = {
-  claude: ['anthropic'],
-  codex: ['aigateway'], // Uses AI Gateway for OpenAI proxy
-  copilot: [], // Uses user's GitHub account token automatically
-  cursor: ['cursor'],
-  gemini: ['gemini'],
-  opencode: [], // Will be determined dynamically based on selected model
-}
-
-type Provider = 'openai' | 'gemini' | 'cursor' | 'anthropic' | 'aigateway'
-
-// Helper to determine which API key is needed for opencode based on model
-const getOpenCodeRequiredKeys = (model: string): Provider[] => {
-  // Check if it's an Anthropic model (claude models)
-  if (model.includes('claude') || model.includes('sonnet') || model.includes('opus')) {
-    return ['anthropic']
-  }
-  // Check if it's an OpenAI/GPT model (uses AI Gateway)
-  if (model.includes('gpt')) {
-    return ['aigateway']
-  }
-  // Fallback to both if we can't determine
-  return ['aigateway', 'anthropic']
-}
+type Provider = 'aigateway'
 
 export function TaskForm({
   onSubmit,
@@ -169,8 +108,8 @@ export function TaskForm({
 }: TaskFormProps) {
   const [prompt, setPrompt] = useAtom(taskPromptAtom)
   const [savedAgent, setSavedAgent] = useAtom(lastSelectedAgentAtom)
-  const [selectedAgent, setSelectedAgent] = useState(savedAgent || 'claude')
-  const [selectedModel, setSelectedModel] = useState<string>(DEFAULT_MODELS.claude)
+  const [selectedAgent, setSelectedAgent] = useState(savedAgent || 'gateway')
+  const [selectedModel, setSelectedModel] = useState<string>(DEFAULT_MODELS.gateway)
   const [selectedModels, setSelectedModels] = useState<string[]>([])
   const [repos, setRepos] = useAtom(githubReposAtomFamily(selectedOwner))
   const [, setLoadingRepos] = useState(false)

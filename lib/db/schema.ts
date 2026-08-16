@@ -77,14 +77,15 @@ export const tasks = pgTable('tasks', {
   id: text('id').primaryKey(),
   userId: text('user_id')
     .notNull()
-    .references(() => users.id, { onDelete: 'cascade' }), // Foreign key to users table
+    .references(() => users.id, { onDelete: 'cascade' }),
   prompt: text('prompt').notNull(),
   title: text('title'),
   repoUrl: text('repo_url'),
   selectedAgent: text('selected_agent').default('claude'),
   selectedModel: text('selected_model'),
+  gatewayModel: text('gateway_model'),
   installDependencies: boolean('install_dependencies').default(false),
-  maxDuration: integer('max_duration').default(parseInt(process.env.MAX_SANDBOX_DURATION || '300', 10)),
+  maxDuration: integer('max_duration').default(parseInt(process.env.MAX_SANDBOX_DURATION || '60', 10)),
   keepAlive: boolean('keep_alive').default(false),
   enableBrowser: boolean('enable_browser').default(false),
   status: text('status', {
@@ -107,23 +108,25 @@ export const tasks = pgTable('tasks', {
   }),
   prMergeCommitSha: text('pr_merge_commit_sha'),
   mcpServerIds: jsonb('mcp_server_ids').$type<string[]>(),
+  webhookSource: jsonb('webhook_source').$type<Record<string, unknown>>(),
+  ingestCursor: timestamp('ingest_cursor'),
   createdAt: timestamp('created_at').defaultNow().notNull(),
   updatedAt: timestamp('updated_at').defaultNow().notNull(),
   completedAt: timestamp('completed_at'),
   deletedAt: timestamp('deleted_at'),
 })
 
-// Manual Zod schemas for validation
 export const insertTaskSchema = z.object({
   id: z.string().optional(),
   userId: z.string().min(1, 'User ID is required'),
   prompt: z.string().min(1, 'Prompt is required'),
   title: z.string().optional(),
   repoUrl: z.string().url('Must be a valid URL').optional(),
-  selectedAgent: z.enum(['claude', 'codex', 'copilot', 'cursor', 'gemini', 'opencode']).default('claude'),
+  selectedAgent: z.enum(['claude', 'codex', 'gateway', 'copilot', 'cursor', 'gemini', 'opencode']).default('gateway'),
   selectedModel: z.string().optional(),
+  gatewayModel: z.string().optional(),
   installDependencies: z.boolean().default(false),
-  maxDuration: z.number().default(parseInt(process.env.MAX_SANDBOX_DURATION || '300', 10)),
+  maxDuration: z.number().default(parseInt(process.env.MAX_SANDBOX_DURATION || '60', 10)),
   keepAlive: z.boolean().default(false),
   enableBrowser: z.boolean().default(false),
   status: z.enum(['pending', 'processing', 'completed', 'error', 'stopped']).default('pending'),
@@ -140,6 +143,8 @@ export const insertTaskSchema = z.object({
   prStatus: z.enum(['open', 'closed', 'merged']).optional(),
   prMergeCommitSha: z.string().optional(),
   mcpServerIds: z.array(z.string()).optional(),
+  webhookSource: z.record(z.string(), z.unknown()).optional(),
+  ingestCursor: z.date().optional(),
   createdAt: z.date().optional(),
   updatedAt: z.date().optional(),
   completedAt: z.date().optional(),
@@ -154,6 +159,7 @@ export const selectTaskSchema = z.object({
   repoUrl: z.string().nullable(),
   selectedAgent: z.string().nullable(),
   selectedModel: z.string().nullable(),
+  gatewayModel: z.string().nullable(),
   installDependencies: z.boolean().nullable(),
   maxDuration: z.number().nullable(),
   keepAlive: z.boolean().nullable(),
@@ -172,6 +178,8 @@ export const selectTaskSchema = z.object({
   prStatus: z.enum(['open', 'closed', 'merged']).nullable(),
   prMergeCommitSha: z.string().nullable(),
   mcpServerIds: z.array(z.string()).nullable(),
+  webhookSource: z.record(z.string(), z.unknown()).nullable(),
+  ingestCursor: z.date().nullable(),
   createdAt: z.date(),
   updatedAt: z.date(),
   completedAt: z.date().nullable(),
@@ -428,7 +436,18 @@ export const selectSettingSchema = z.object({
 export type Setting = z.infer<typeof selectSettingSchema>
 export type InsertSetting = z.infer<typeof insertSettingSchema>
 
-// Keep legacy export for backwards compatibility during migration
+export const webhookEvents = pgTable('webhook_events', {
+  id: text('id').primaryKey(),
+  provider: text('provider').notNull(),
+  eventType: text('event_type').notNull(),
+  payload: jsonb('payload').$type<Record<string, unknown>>(),
+  taskId: text('task_id').references(() => tasks.id, { onDelete: 'set null' }),
+  createdAt: timestamp('created_at').defaultNow().notNull(),
+})
+
+export type WebhookEvent = typeof webhookEvents.$inferSelect
+export type InsertWebhookEvent = typeof webhookEvents.$inferInsert
+
 export const userConnections = accounts
 export type UserConnection = Account
 export type InsertUserConnection = InsertAccount

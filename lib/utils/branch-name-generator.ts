@@ -37,12 +37,10 @@ Examples of good branch names:
 Return ONLY the branch name, nothing else.`
 
   try {
-    // Generate branch name using AI SDK 5 with AI Gateway
-    const result = await generateText({
-      model: 'openai/gpt-5-nano',
-      prompt,
-      temperature: 0.3,
-    })
+    const result = await Promise.race([
+      generateText({ model: 'openai/gpt-5-nano', prompt, temperature: 0.3 }),
+      new Promise<never>((_, reject) => setTimeout(() => reject(new Error('Branch name timeout')), 4000)),
+    ])
 
     // Clean up the response (remove any extra whitespace or quotes)
     const baseBranchName = result.text.trim().replace(/^["']|["']$/g, '')

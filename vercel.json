@@ -1,9 +1,22 @@
 {
   "functions": {
     "app/api/tasks/route.ts": {
-      "maxDuration": 300
+      "maxDuration": 10
+    },
+    "app/api/tasks/[taskId]/start/route.ts": {
+      "maxDuration": 10
+    },
+    "app/api/cron/reap/route.ts": {
+      "maxDuration": 10
+    },
+    "app/api/webhooks/github/route.ts": {
+      "maxDuration": 10
     }
   },
-  "crons": []
+  "crons": [
+    {
+      "path": "/api/cron/reap",
+      "schedule": "*/5 * * * *"
+    }
+  ]
 }
-

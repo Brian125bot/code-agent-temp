@@ -229,10 +229,10 @@ export function HomePageContent({
       const taskData = {
         prompt: 'Work on this repository',
         repoUrl: repoUrl,
-        selectedAgent: localStorage.getItem('last-selected-agent') || 'claude',
-        selectedModel: localStorage.getItem('last-selected-model-claude') || 'claude-sonnet-4-5',
+        selectedAgent: localStorage.getItem('last-selected-agent') || 'gateway',
+        selectedModel: localStorage.getItem('last-selected-model-gateway') || 'openai/gpt-5-nano',
         installDependencies: true,
-        maxDuration: 300,
+        maxDuration: 60,
         keepAlive: false,
       }
 
@@ -521,21 +521,20 @@ export function HomePageContent({
         })
 
         if (response.ok) {
-          toast.success('Task created successfully!')
-          // Refresh sidebar to get the real task data from server
+          const created = await response.json().catch(() => null)
+          const taskId = created?.task?.id || id
+          fetch(`/api/tasks/${taskId}/start`, { method: 'POST' }).catch(() => {})
+          toast.success('Task created — agent starting...')
           await refreshTasks()
         } else {
           const error = await response.json()
-          // Show detailed message for rate limits, or generic error message
           toast.error(error.message || error.error || 'Failed to create task')
-          // TODO: Remove the optimistic task on error
-          await refreshTasks() // For now, just refresh to remove the optimistic task
+          await refreshTasks()
         }
       } catch (error) {
         console.error('Error creating task:', error)
         toast.error('Failed to create task')
-        // TODO: Remove the optimistic task on error
-        await refreshTasks() // For now, just refresh to remove the optimistic task
+        await refreshTasks()
       } finally {
         setIsSubmitting(false)
       }

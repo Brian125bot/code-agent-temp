@@ -16,12 +16,15 @@ interface ApiKeysDialogProps {
 type Provider = 'openai' | 'gemini' | 'cursor' | 'anthropic' | 'aigateway'
 
 const PROVIDERS = [
-  { id: 'aigateway' as Provider, name: 'AI Gateway', placeholder: 'gw_...' },
-  { id: 'anthropic' as Provider, name: 'Anthropic', placeholder: 'sk-ant-...' },
-  { id: 'openai' as Provider, name: 'OpenAI', placeholder: 'sk-...' },
-  { id: 'gemini' as Provider, name: 'Gemini', placeholder: 'AIza...' },
-  { id: 'cursor' as Provider, name: 'Cursor', placeholder: 'cur_...' },
-]
+  { id: 'aigateway' as Provider, name: 'AI Gateway (required)', placeholder: 'vck_... or gw_...' },
+] as const
+
+const LEGACY_PROVIDERS = [
+  { id: 'anthropic' as Provider, name: 'Anthropic (legacy)', placeholder: 'sk-ant-...' },
+  { id: 'openai' as Provider, name: 'OpenAI (legacy)', placeholder: 'sk-...' },
+  { id: 'gemini' as Provider, name: 'Gemini (legacy)', placeholder: 'AIza...' },
+  { id: 'cursor' as Provider, name: 'Cursor (legacy)', placeholder: 'cur_...' },
+] as const
 
 export function ApiKeysDialog({ open, onOpenChange }: ApiKeysDialogProps) {
   const [apiKeys, setApiKeys] = useState<Record<Provider, string>>({
@@ -180,7 +183,7 @@ export function ApiKeysDialog({ open, onOpenChange }: ApiKeysDialogProps) {
         <DialogHeader>
           <DialogTitle>API Keys</DialogTitle>
           <DialogDescription>
-            Configure your own API keys. System defaults will be used if not provided.
+            All inference via Vercel AI Gateway. Add your Gateway key (vck_...) to enable agents.
           </DialogDescription>
         </DialogHeader>
 
@@ -239,6 +242,63 @@ export function ApiKeysDialog({ open, onOpenChange }: ApiKeysDialogProps) {
             )
           })}
         </div>
+        <details className="mt-2">
+          <summary className="text-xs text-muted-foreground cursor-pointer">Legacy providers</summary>
+          <div className="space-y-2 mt-2 opacity-60">
+            {LEGACY_PROVIDERS.map((provider) => {
+              const hasSavedKey = savedKeys.has(provider.id)
+              const isCleared = clearedKeys.has(provider.id)
+              const showSaveButton = !hasSavedKey || isCleared
+              const isInputDisabled = hasSavedKey && !isCleared
+              return (
+                <div key={provider.id} className="flex items-center gap-2">
+                  <Label htmlFor={provider.id} className="text-sm w-24 shrink-0">
+                    {provider.name}
+                  </Label>
+                  <div className="relative flex-1">
+                    <Input
+                      id={provider.id}
+                      type={showKeys[provider.id] ? 'text' : 'password'}
+                      placeholder={hasSavedKey && !isCleared ? '••••••••••••••••' : provider.placeholder}
+                      value={apiKeys[provider.id]}
+                      onChange={(e) => setApiKeys((prev) => ({ ...prev, [provider.id]: e.target.value }))}
+                      disabled={loading || isInputDisabled}
+                      className="pr-9 h-8 text-sm"
+                    />
+                    <button
+                      onClick={() => toggleShowKey(provider.id)}
+                      className="absolute right-2 top-1/2 -translate-y-1/2 text-muted-foreground hover:text-foreground transition-colors"
+                      type="button"
+                      disabled={loading || isInputDisabled}
+                    >
+                      {showKeys[provider.id] ? <EyeOff className="h-3.5 w-3.5" /> : <Eye className="h-3.5 w-3.5" />}
+                    </button>
+                  </div>
+                  {showSaveButton ? (
+                    <Button
+                      size="sm"
+                      onClick={() => handleSave(provider.id)}
+                      disabled={loading || !apiKeys[provider.id].trim()}
+                      className="h-8 px-3 text-xs w-16"
+                    >
+                      Save
+                    </Button>
+                  ) : (
+                    <Button
+                      variant="ghost"
+                      size="sm"
+                      onClick={() => handleClear(provider.id)}
+                      disabled={loading}
+                      className="h-8 px-3 text-xs w-16"
+                    >
+                      Clear
+                    </Button>
+                  )}
+                </div>
+              )
+            })}
+          </div>
+        </details>
       </DialogContent>
     </Dialog>
   )

@@ -2,14 +2,11 @@ import { Sandbox } from '@vercel/sandbox'
 import { AgentExecutionResult } from '../types'
 import { executeClaudeInSandbox } from './claude'
 import { executeCodexInSandbox } from './codex'
-import { executeCopilotInSandbox } from './copilot'
-import { executeCursorInSandbox } from './cursor'
-import { executeGeminiInSandbox } from './gemini'
-import { executeOpenCodeInSandbox } from './opencode'
+import { executeGatewayInSandbox } from './gateway'
 import { TaskLogger } from '@/lib/utils/task-logger'
 import { Connector } from '@/lib/db/schema'
 
-export type AgentType = 'claude' | 'codex' | 'copilot' | 'cursor' | 'gemini' | 'opencode'
+export type AgentType = 'gateway' | 'claude' | 'codex' | 'copilot' | 'cursor' | 'gemini' | 'opencode'
 
 // Re-export types
 export type { AgentExecutionResult } from '../types'
@@ -76,6 +73,9 @@ export async function executeAgentInSandbox(
 
   try {
     switch (agentType) {
+      case 'gateway':
+        return await executeGatewayInSandbox(sandbox, instruction, logger, selectedModel)
+
       case 'claude':
         return await executeClaudeInSandbox(
           sandbox,
@@ -101,33 +101,45 @@ export async function executeAgentInSandbox(
         )
 
       case 'copilot':
-        return await executeCopilotInSandbox(
-          sandbox,
-          instruction,
-          logger,
-          selectedModel,
-          mcpServers,
-          isResumed,
-          sessionId,
-          taskId,
-        )
-
       case 'cursor':
-        return await executeCursorInSandbox(
-          sandbox,
-          instruction,
-          logger,
-          selectedModel,
-          mcpServers,
-          isResumed,
-          sessionId,
-          taskId,
-        )
-
       case 'gemini':
-        return await executeGeminiInSandbox(sandbox, instruction, logger, selectedModel, mcpServers)
-
-      case 'opencode':
+      case 'opencode': {
+        if (!process.env.ENABLE_LEGACY_AGENTS) {
+          return {
+            success: false,
+            error: `Legacy agent ${agentType} is disabled. Use gateway, claude, or codex via AI Gateway.`,
+            cliName: agentType,
+            changesDetected: false,
+          }
+        }
+        const { executeCopilotInSandbox } = await import('./copilot')
+        const { executeCursorInSandbox } = await import('./cursor')
+        const { executeGeminiInSandbox } = await import('./gemini')
+        const { executeOpenCodeInSandbox } = await import('./opencode')
+        if (agentType === 'copilot')
+          return await executeCopilotInSandbox(
+            sandbox,
+            instruction,
+            logger,
+            selectedModel,
+            mcpServers,
+            isResumed,
+            sessionId,
+            taskId,
+          )
+        if (agentType === 'cursor')
+          return await executeCursorInSandbox(
+            sandbox,
+            instruction,
+            logger,
+            selectedModel,
+            mcpServers,
+            isResumed,
+            sessionId,
+            taskId,
+          )
+        if (agentType === 'gemini')
+          return await executeGeminiInSandbox(sandbox, instruction, logger, selectedModel, mcpServers)
         return await executeOpenCodeInSandbox(
           sandbox,
           instruction,
@@ -137,6 +149,7 @@ export async function executeAgentInSandbox(
           isResumed,
           sessionId,
         )
+      }
 
       default:
         return {

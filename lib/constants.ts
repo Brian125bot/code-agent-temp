@@ -1,8 +1,20 @@
 // Rate limiting configuration
 export const MAX_MESSAGES_PER_DAY = parseInt(process.env.MAX_MESSAGES_PER_DAY || '5', 10)
 
-// Sandbox configuration (in minutes)
-export const MAX_SANDBOX_DURATION = parseInt(process.env.MAX_SANDBOX_DURATION || '300', 10)
+export const MAX_SANDBOX_DURATION = parseInt(process.env.MAX_SANDBOX_DURATION || '60', 10)
+
+export const GATEWAY_BASE_URL = 'https://ai-gateway.vercel.sh'
+
+export const GATEWAY_DEFAULT_MODEL = 'openai/gpt-5-nano'
+
+export const GATEWAY_MODELS = [
+  'openai/gpt-5',
+  'openai/gpt-5-mini',
+  'openai/gpt-5-nano',
+  'anthropic/claude-sonnet-4-5',
+  'anthropic/claude-haiku-4-5',
+  'google/gemini-2.5-pro',
+] as const
 
 // Vercel deployment configuration
 export const VERCEL_DEPLOY_URL =

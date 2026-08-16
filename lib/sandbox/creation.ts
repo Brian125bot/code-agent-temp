@@ -86,7 +86,7 @@ export async function createSandbox(config: SandboxConfig, logger: TaskLogger): 
       timeout: timeoutMs,
       ports: defaultPorts,
       runtime: config.runtime || 'node22',
-      resources: { vcpus: config.resources?.vcpus || 4 },
+      resources: { vcpus: config.resources?.vcpus || 2 },
     }
 
     // Call progress callback before sandbox creation
