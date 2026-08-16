@@ -7,17 +7,23 @@ Give it a repo + a task and it works **detached**: clones, branches, edits code 
 ![Coding Agent Template Screenshot](screenshot.png)
 
 ## Table of Contents
+
 - [What This Is](#what-this-is)
 - [How Jules-Style Async Works Here](#how-jules-style-async-works-here)
 - [Architecture](#architecture)
 - [Free-Tier Constraints (and How They Are Met)](#free-tier-constraints-and-how-they-are-met)
 - [Vercel AI Gateway — The Only Model Path](#vercel-ai-gateway--the-only-model-path)
+- [Plan Approval Workflow (Gateway Agent)](#plan-approval-workflow-gateway-agent)
+- [Task Steering](#task-steering)
+- [Audio Changelog](#audio-changelog)
+- [Metrics Dashboard](#metrics-dashboard)
 - [Deploy to Vercel (One Click)](#deploy-to-vercel-one-click)
 - [Local Development](#local-development)
+- [Full Documentation](#full-documentation)
 - [Configuration Reference](#configuration-reference)
 - [API Reference](#api-reference)
 - [GitHub Webhook — `/jules` Trigger](#github-webhook--jules-trigger)
-- [Cron Reaper](#cron-reaper)
+- [Cron Jobs](#cron-jobs)
 - [Task & Database Model](#task--database-model)
 - [Security](#security)
 - [Development Scripts](#development-scripts)
@@ -65,14 +71,14 @@ If you came from the original template, see [What Changed](#what-changed-from-th
 
 ## Architecture
 
-| Layer | Choice | Why |
-|------|--------|-----|
-| Compute | **Vercel Sandbox** (`@vercel/sandbox`) | Isolated VM that outlives the serverless function — perfect for Jules detached work. Free-tier trick: the function only *starts* the VM (<10s). |
-| Inference | **Vercel AI Gateway** (`ai` SDK `generateText` with `openai/gpt-5-nano`, `anthropic/...`) | Single key, model routing by string, no per-provider secrets. Branch/title/commit names and the native `gateway` agent all use it. |
-| Async | Two-phase `POST /api/tasks` → `POST /api/tasks/[id]/start` + polling + `GET /api/cron/reap` | Hobby has no Queues/Workflow. The VM is the queue; the cron is the reaper. |
-| DB | **Neon Postgres** + **Drizzle ORM** (`drizzle.config.ts`) | Provisioned automatically via the Vercel Deploy Button (`vercel-template.json`). |
-| Auth | **GitHub** and/or **Vercel OAuth** (`arctic` + `jose` JWE cookie) | Same as upstream — required for repo access. |
-| UI | Next.js 16, React 19, Tailwind, shadcn/ui | Unchanged. |
+| Layer     | Choice                                                                                      | Why                                                                                                                                             |
+| --------- | ------------------------------------------------------------------------------------------- | ----------------------------------------------------------------------------------------------------------------------------------------------- |
+| Compute   | **Vercel Sandbox** (`@vercel/sandbox`)                                                      | Isolated VM that outlives the serverless function — perfect for Jules detached work. Free-tier trick: the function only _starts_ the VM (<10s). |
+| Inference | **Vercel AI Gateway** (`ai` SDK `generateText` with `openai/gpt-5-nano`, `anthropic/...`)   | Single key, model routing by string, no per-provider secrets. Branch/title/commit names and the native `gateway` agent all use it.              |
+| Async     | Two-phase `POST /api/tasks` → `POST /api/tasks/[id]/start` + polling + `GET /api/cron/reap` | Hobby has no Queues/Workflow. The VM is the queue; the cron is the reaper.                                                                      |
+| DB        | **Neon Postgres** + **Drizzle ORM** (`drizzle.config.ts`)                                   | Provisioned automatically via the Vercel Deploy Button (`vercel-template.json`).                                                                |
+| Auth      | **GitHub** and/or **Vercel OAuth** (`arctic` + `jose` JWE cookie)                           | Same as upstream — required for repo access.                                                                                                    |
+| UI        | Next.js 16, React 19, Tailwind, shadcn/ui                                                   | Unchanged.                                                                                                                                      |
 
 ### Request lifecycle (annotated)
 
@@ -117,9 +123,54 @@ export const GATEWAY_MODELS = [
 
 > **Key shape**: `AI_GATEWAY_API_KEY` accepts `vck_...` (Vercel-issued Gateway key) or `gw_...`.
 
+## Plan Approval Workflow (Gateway Agent)
+
+When using the default `gateway` agent, task execution is split into **two phases** — planning and execution — with a **user approval checkpoint** in between:
+
+1. **Plan**: The planner agent (Gemini Pro via AI Gateway) explores your repo and generates a structured plan (`goal`, `assumptions`, `steps` with risk levels, file/LOC estimates, test command). Stored in the `plans` table; task enters `awaiting_approval` status.
+2. **Approve**: You review the plan in the UI (`PlanEditor` component), optionally edit it (JSON editor with Zod validation), and click "Approve & Run".
+3. **Execute**: `POST /api/tasks/[taskId]/approve` triggers `runExecutionPhase()` — a new sandbox is created, the agent executes with the approved plan appended to the prompt, pushes changes, and creates a PR.
+
+During `processing`, you can also **steer** the agent mid-run with guidance messages. See [Plan Approval Workflow](./docs/features/planning.md) and [Task Steering](./docs/features/steering.md) for full details.
+
+> **CI auto-fix**: If the task prompt starts with `"CI failed"`, the planner is constrained to at most 3 steps and 2 files — minimum change to make CI green, no scope creep.
+
+## Task Steering
+
+While a task is in `processing` status, you can send mid-run guidance messages via `POST /api/tasks/[taskId]/steer`:
+
+- Max 2000 characters per message
+- 5-second cooldown between messages (returns `429` with `Retry-After: 5`)
+- The Gateway agent polls the `steering_messages` table after every tool call and injects pending messages into its context
+- Rendered in the UI by the `SteerInput` component — a text box that appears at the bottom of the task view during `processing`
+
+See [Task Steering](./docs/features/steering.md) for details.
+
+## Audio Changelog
+
+After a task completes, you can generate an AI-narrated changelog:
+
+- **Manual**: Click "Generate" in the `AudioPlayer` component (shown on completed tasks)
+- **Automatic**: The `/api/cron/audio` cron job (every 10 min) generates audio for completed tasks without one
+- Uses `openai/gpt-5-nano` (via Gateway) to generate a 60–90 second transcript explaining what the PR does
+- Optionally converts to MP3 via **ElevenLabs** (`ELEVENLABS_API_KEY`); falls back to a text file if not configured
+- Stored in **Vercel Blob** (public URL); cached by diff hash to avoid re-generation
+- Posted as a comment on the PR: `🎧 [Listen](url) (Xs) — AI-generated changelog`
+
+See [Audio Changelog](./docs/features/audio-summaries.md) for details.
+
+## Metrics Dashboard
+
+Daily task metrics are aggregated automatically and displayed on an admin-only page:
+
+- **Route**: `/admin/metrics` (gated by `NEXT_PUBLIC_ADMIN_ENABLED=true`)
+- **Cron**: `/api/cron/metrics` runs daily at 00:05 UTC, counts tasks created/completed/failed
+- Shows a 7-day summary table, success rate chart, and 30-day expandable view
+- See [Metrics Dashboard](./docs/features/metrics.md) for details
+
 ## Deploy to Vercel (One Click)
 
-[![Deploy with Vercel](https://vercel.com/button)](https://vercel.com/new/clone?repository-url=https%3A%2F%2Fgithub.com%2Fvercel-labs%2Fcoding-agent-template&env=SANDBOX_VERCEL_TEAM_ID,SANDBOX_VERCEL_PROJECT_ID,SANDBOX_VERCEL_TOKEN,JWE_SECRET,ENCRYPTION_KEY&envDescription=Required+environment+variables+for+the+coding+agent+template.+You+must+also+configure+at+least+one+OAuth+provider+(GitHub+or+Vercel)+after+deployment.+Optional+API+keys+can+be+added+later.&stores=%5B%7B%22type%22%3A%22postgres%22%7D%5D&project-name=coding-agent-template&repository-name=coding-agent-template)
+[![Deploy with Vercel](https://vercel.com/button)](<https://vercel.com/new/clone?repository-url=https%3A%2F%2Fgithub.com%2Fvercel-labs%2Fcoding-agent-template&env=SANDBOX_VERCEL_TEAM_ID,SANDBOX_VERCEL_PROJECT_ID,SANDBOX_VERCEL_TOKEN,JWE_SECRET,ENCRYPTION_KEY&envDescription=Required+environment+variables+for+the+coding+agent+template.+You+must+also+configure+at+least+one+OAuth+provider+(GitHub+or+Vercel)+after+deployment.+Optional+API+keys+can+be+added+later.&stores=%5B%7B%22type%22%3A%22postgres%22%7D%5D&project-name=coding-agent-template&repository-name=coding-agent-template>)
 
 What happens:
 
@@ -141,25 +192,42 @@ pnpm dev   # http://localhost:3000
 
 `pnpm dev` runs `next dev --webpack`. Do **not** run multiple dev servers against the same port.
 
+## Full Documentation
+
+This README provides a high-level overview. For comprehensive documentation, see the `docs/` directory:
+
+- **[Setup Guide](./docs/setup.md)** — detailed local and production setup instructions
+- **[Configuration Reference](./docs/configuration.md)** — complete environment variable reference with `.env.local` template
+- **[Architecture](./docs/architecture.md)** — deep dive on the two-phase execution model and state machine
+- **[API Reference](./docs/api.md)** — complete REST API documentation
+- **[Database Schema](./docs/database.md)** — all tables, columns, and migrations
+- **[Agent Configuration](./docs/agents.md)** — Gateway, Claude, Codex, and legacy agents
+- **[Plan Approval Workflow](./docs/features/planning.md)** — plan generation and approval flow
+- **[Task Steering](./docs/features/steering.md)** — mid-run agent guidance
+- **[Audio Changelog](./docs/features/audio-summaries.md)** — AI-narrated changelog feature
+- **[Metrics Dashboard](./docs/features/metrics.md)** — daily task metrics
+- **[Development Guide](./docs/development.md)** — scripts, code style, and contributing
+- **[Security Guidelines](./docs/security.md)** — logging policy, credential handling, and compliance checklist
+
 ## Configuration Reference
 
 ### Required — App infrastructure (set once, by you)
 
-| Variable | Where used | How to get it |
-|----------|-----------|---------------|
-| `POSTGRES_URL` | `drizzle.config.ts`, `lib/db/client.ts`, `scripts/migrate-production.ts` | Auto-set on Vercel via Neon integration; locally, any Postgres URL |
-| `SANDBOX_VERCEL_TOKEN` | `lib/sandbox/creation.ts`, 12+ sandbox routes | Vercel Dashboard → your project → Settings → Tokens |
-| `SANDBOX_VERCEL_TEAM_ID` | Same as above | Vercel Dashboard → Team settings → General |
-| `SANDBOX_VERCEL_PROJECT_ID` | Same as above | Vercel Dashboard → Project → Settings → General (or `.vercel/project.json`) |
-| `JWE_SECRET` | `lib/jwe/encrypt.ts`, `lib/jwe/decrypt.ts` | `openssl rand -base64 32` |
-| `ENCRYPTION_KEY` | `lib/crypto.ts` | `openssl rand -hex 32` (32 bytes, hex) |
+| Variable                    | Where used                                                               | How to get it                                                               |
+| --------------------------- | ------------------------------------------------------------------------ | --------------------------------------------------------------------------- |
+| `POSTGRES_URL`              | `drizzle.config.ts`, `lib/db/client.ts`, `scripts/migrate-production.ts` | Auto-set on Vercel via Neon integration; locally, any Postgres URL          |
+| `SANDBOX_VERCEL_TOKEN`      | `lib/sandbox/creation.ts`, 12+ sandbox routes                            | Vercel Dashboard → your project → Settings → Tokens                         |
+| `SANDBOX_VERCEL_TEAM_ID`    | Same as above                                                            | Vercel Dashboard → Team settings → General                                  |
+| `SANDBOX_VERCEL_PROJECT_ID` | Same as above                                                            | Vercel Dashboard → Project → Settings → General (or `.vercel/project.json`) |
+| `JWE_SECRET`                | `lib/jwe/encrypt.ts`, `lib/jwe/decrypt.ts`                               | `openssl rand -base64 32`                                                   |
+| `ENCRYPTION_KEY`            | `lib/crypto.ts`                                                          | `openssl rand -hex 32` (32 bytes, hex)                                      |
 
 ### Required — Auth (at least one)
 
-| Variable | Meaning |
-|----------|---------|
-| `NEXT_PUBLIC_AUTH_PROVIDERS` | `"github"`, `"vercel"`, or `"github,vercel"` (default `github`) |
-| `NEXT_PUBLIC_GITHUB_CLIENT_ID` / `GITHUB_CLIENT_SECRET` | GitHub OAuth App; callback `https://<host>/api/auth/github/callback` |
+| Variable                                                | Meaning                                                                      |
+| ------------------------------------------------------- | ---------------------------------------------------------------------------- |
+| `NEXT_PUBLIC_AUTH_PROVIDERS`                            | `"github"`, `"vercel"`, or `"github,vercel"` (default `github`)              |
+| `NEXT_PUBLIC_GITHUB_CLIENT_ID` / `GITHUB_CLIENT_SECRET` | GitHub OAuth App; callback `https://<host>/api/auth/github/callback`         |
 | `NEXT_PUBLIC_VERCEL_CLIENT_ID` / `VERCEL_CLIENT_SECRET` | Vercel OAuth integration; callback `https://<host>/api/auth/callback/vercel` |
 
 Create OAuth apps:
@@ -169,21 +237,24 @@ Create OAuth apps:
 
 ### AI — Gateway only
 
-| Variable | Meaning |
-|----------|---------|
+| Variable             | Meaning                                                                                                                                                                                                                       |
+| -------------------- | ----------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- |
 | `AI_GATEWAY_API_KEY` | Vercel AI Gateway key (`vck_...` or `gw_...`). Global fallback; **or** set per-user in the profile dialog (`keys.provider = 'aigateway'`, stored encrypted). Required for branch/title/commit generation and for every agent. |
 
 ### Optional
 
-| Variable | Default | Meaning |
-|----------|---------|---------|
-| `MAX_SANDBOX_DURATION` | `60` | Minutes the Sandbox VM lives (`lib/constants.ts`). Original template defaulted to `300`; trimmed for Hobby. |
-| `MAX_MESSAGES_PER_DAY` | `5` | Tasks + follow-ups per user per day (`lib/utils/rate-limit.ts`). |
-| `NPM_TOKEN` | — | Private npm access inside sandboxes. |
-| `GITHUB_WEBHOOK_SECRET` | — | HMAC for `POST /api/webhooks/github` (`x-hub-signature-256`). If unset, signature verification is skipped (noisy; set it in prod). |
-| `WEBHOOK_DEFAULT_USER_ID` | — | User ID to attribute webhook-created tasks to when the webhook has no session. Required if you enable the `/jules` webhook without per-install user mapping. |
-| `INGEST_TOKEN` / `CRON_SECRET` | — | Bearer tokens for `POST /api/tasks/[id]/ingest-logs` and `GET /api/cron/reap` if you call them outside Vercel cron. |
-| `ENABLE_LEGACY_AGENTS` | — | Set to `1` to allow `copilot`/`cursor`/`gemini`/`opencode` in `lib/sandbox/agents/index.ts`. Default: blocked with a helpful error. |
+| Variable                       | Default                | Meaning                                                                                                                                                      |
+| ------------------------------ | ---------------------- | ------------------------------------------------------------------------------------------------------------------------------------------------------------ |
+| `MAX_SANDBOX_DURATION`         | `60`                   | Minutes the Sandbox VM lives (`lib/constants.ts`). Original template defaulted to `300`; trimmed for Hobby.                                                  |
+| `MAX_MESSAGES_PER_DAY`         | `5`                    | Tasks + follow-ups per user per day (`lib/utils/rate-limit.ts`).                                                                                             |
+| `NPM_TOKEN`                    | —                      | Private npm access inside sandboxes.                                                                                                                         |
+| `GITHUB_WEBHOOK_SECRET`        | —                      | HMAC for `POST /api/webhooks/github` (`x-hub-signature-256`). If unset, signature verification is skipped (noisy; set it in prod).                           |
+| `WEBHOOK_DEFAULT_USER_ID`      | —                      | User ID to attribute webhook-created tasks to when the webhook has no session. Required if you enable the `/jules` webhook without per-install user mapping. |
+| `INGEST_TOKEN` / `CRON_SECRET` | —                      | Bearer tokens for `POST /api/tasks/[id]/ingest-logs` and cron routes if you call them outside Vercel cron.                                                   |
+| `ENABLE_LEGACY_AGENTS`         | —                      | Set to `1` to allow `copilot`/`cursor`/`gemini`/`opencode` in `lib/sandbox/agents/index.ts`. Default: blocked with a helpful error.                          |
+| `NEXT_PUBLIC_ADMIN_ENABLED`    | —                      | Set to `true` to enable the `/admin/metrics` dashboard page.                                                                                                 |
+| `ELEVENLABS_API_KEY`           | —                      | ElevenLabs API key for MP3 audio generation of changelog summaries. If unset, audio summaries are stored as text files.                                      |
+| `ELEVENLABS_VOICE_ID`          | `21m00Tcm4TlvDq8ikWAM` | Custom voice ID for ElevenLabs TTS.                                                                                                                          |
 
 > `.env*` is gitignored. Never commit `.env.local`.
 
@@ -193,17 +264,24 @@ All task routes require **authentication** (`getServerSession()` via JWE cookie 
 
 ### Tasks
 
-| Method | Path | Description |
-|--------|------|-------------|
-| `GET` | `/api/tasks` | List your tasks (`deletedAt IS NULL`, newest first). |
-| `POST` | `/api/tasks` | Create a task. **Returns 201 in ≤3.5s** (Hobby-safe). Upgrades `branchName`/`title` in the background. Body: `insertTaskSchema` (see below). |
-| `DELETE` | `/api/tasks?action=completed,failed,stopped` | Hard-delete by status, scoped to `userId`. |
-| `GET` | `/api/tasks/[taskId]` | Fetch one task (authz `userId` + `isNull(deletedAt)`). |
-| `PATCH` | `/api/tasks/[taskId]` | Update task (`action: 'stop'` kills sandbox, etc.). |
-| `DELETE` | `/api/tasks/[taskId]` | Soft-delete (`deletedAt = now()`). |
-| `POST` | `/api/tasks/[taskId]/start` | **Hobby async start** — creates the Sandbox, streams `processing` logs, runs `runTaskAsync()` (agent → push → `completed`/`error`). Fire-and-forget; UI calls it immediately after `POST /api/tasks`. `maxDuration: 10`. |
-| `POST` | `/api/tasks/[taskId]/continue` | Follow-up (`{ message }`): inserts `task_messages` (`role: 'user'`), resumes Sandbox if `keepAlive && sandboxId`, re-runs the selected agent with history. |
-| `GET` | `/api/tasks/[taskId]/messages` | `task_messages` for the task (`ORDER BY createdAt`). |
+| Method   | Path                                         | Description                                                                                                                                                                                                          |
+| -------- | -------------------------------------------- | -------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- |
+| `GET`    | `/api/tasks`                                 | List your tasks (`deletedAt IS NULL`, newest first).                                                                                                                                                                 |
+| `POST`   | `/api/tasks`                                 | Create a task. **Returns 201 in ≤3.5s** (Hobby-safe). Upgrades `branchName`/`title` in the background. Body: `insertTaskSchema` (see below).                                                                         |
+| `DELETE` | `/api/tasks?action=completed,failed,stopped` | Hard-delete by status, scoped to `userId`.                                                                                                                                                                           |
+| `GET`    | `/api/tasks/[taskId]`                        | Fetch one task (authz `userId` + `isNull(deletedAt)`).                                                                                                                                                               |
+| `PATCH`  | `/api/tasks/[taskId]`                        | Update task (`action: 'stop'` kills sandbox, etc.).                                                                                                                                                                  |
+| `DELETE` | `/api/tasks/[taskId]`                        | Soft-delete (`deletedAt = now()`).                                                                                                                                                                                   |
+| `POST`   | `/api/tasks/[taskId]/start`                  | **Hobby async start** — creates the Sandbox, runs `runTaskAsync()` or `runPlannerPhase()` (agent → push → `completed`/`error`). Fire-and-forget; UI calls it immediately after `POST /api/tasks`. `maxDuration: 10`. |
+| `POST`   | `/api/tasks/[taskId]/continue`               | Follow-up (`{ message }`): inserts `task_messages` (`role: 'user'`), resumes Sandbox if `keepAlive && sandboxId`, re-runs the selected agent with history.                                                           |
+| `GET`    | `/api/tasks/[taskId]/messages`               | `task_messages` for the task (`ORDER BY createdAt`).                                                                                                                                                                 |
+| `POST`   | `/api/tasks/[taskId]/plan`                   | Create a new plan version. Body validated against `planSchema` (Zod).                                                                                                                                                |
+| `GET`    | `/api/tasks/[taskId]/plan`                   | List all plans for a task (newest version first).                                                                                                                                                                    |
+| `POST`   | `/api/tasks/[taskId]/approve`                | Approve a plan → sets `status: 'processing'` → triggers `runExecutionPhase()` via `after()`. Only valid when `status === 'awaiting_approval'`.                                                                       |
+| `POST`   | `/api/tasks/[taskId]/steer`                  | Inject a mid-run guidance message (max 2000 chars, 5s cooldown). Only valid when `status === 'processing'`. Body: `{ message: string }`.                                                                             |
+| `POST`   | `/api/tasks/[taskId]/audio`                  | Generate an audio changelog for a completed task (`202` queued, `200` if cached).                                                                                                                                    |
+| `GET`    | `/api/tasks/[taskId]/audio`                  | Fetch the latest audio summary for a task (or null).                                                                                                                                                                 |
+| `POST`   | `/api/tasks/[taskId]/retry`                  | Retry a failed/stopped task. `gateway` agent → `runPlannerPhase()`; legacy agents → `runTaskAsync()`.                                                                                                                |
 
 #### `POST /api/tasks` body (`insertTaskSchema`)
 
@@ -232,47 +310,73 @@ Response `201 { task }` — the task row as stored (the `branchName`/`title` may
 
 `pending` → `processing` → `completed` | `error` | `stopped` (with `progress 0-100`, `logs: LogEntry[]`, `error?`, `prUrl/prNumber/prStatus`, `sandboxId/sandboxUrl`, `agentSessionId`).
 
+For the `gateway` agent, an intermediate `awaiting_approval` status is inserted: `pending` → `processing` → `awaiting_approval` → `processing` → `completed` | `error` | `stopped`.
+
+`GET /api/tasks/[taskId]` also returns the latest `plan` (if any) and `audioSummary` (if any) alongside the task.
+
 ### Sandboxes
 
-| Method | Path | Description |
-|--------|------|-------------|
-| `GET` | `/api/sandboxes` | Your active sandboxes (`sandboxId IS NOT NULL`). |
-| `GET` | `/api/tasks/[taskId]/sandbox-health` | `sandbox.runCommand('pwd')` probe. |
-| `POST` | `/api/tasks/[taskId]/start-sandbox` | Recreate/attach to sandbox if it died. |
-| `POST` | `/api/tasks/[taskId]/stop-sandbox` | `killSandbox(taskId)` + `sandboxId = NULL`. |
-| `POST` | `/api/tasks/[taskId]/restart-dev` | Re-start `npm run dev` (detached + host fixup). |
-| `POST` | `/api/tasks/[taskId]/terminal` | `POST { command }` → `sandbox.runCommand('sh', ['-c', cmd])`. |
-| `POST` | `/api/tasks/[taskId]/ingest-logs` | Internal: `POST { logs: LogEntry[], progress?, status? }` — appends to `tasks.logs`. Authorized by `x-vercel-cron` or `Bearer $SANDBOX_VERCEL_TOKEN` / `Bearer $INGEST_TOKEN`. Not user-sessioned. |
+| Method | Path                                 | Description                                                                                                                                                                                        |
+| ------ | ------------------------------------ | -------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- |
+| `GET`  | `/api/sandboxes`                     | Your active sandboxes (`sandboxId IS NOT NULL`).                                                                                                                                                   |
+| `GET`  | `/api/tasks/[taskId]/sandbox-health` | `sandbox.runCommand('pwd')` probe.                                                                                                                                                                 |
+| `POST` | `/api/tasks/[taskId]/start-sandbox`  | Recreate/attach to sandbox if it died.                                                                                                                                                             |
+| `POST` | `/api/tasks/[taskId]/stop-sandbox`   | `killSandbox(taskId)` + `sandboxId = NULL`.                                                                                                                                                        |
+| `POST` | `/api/tasks/[taskId]/restart-dev`    | Re-start `npm run dev` (detached + host fixup).                                                                                                                                                    |
+| `POST` | `/api/tasks/[taskId]/terminal`       | `POST { command }` → `sandbox.runCommand('sh', ['-c', cmd])`.                                                                                                                                      |
+| `POST` | `/api/tasks/[taskId]/ingest-logs`    | Internal: `POST { logs: LogEntry[], progress?, status? }` — appends to `tasks.logs`. Authorized by `x-vercel-cron` or `Bearer $SANDBOX_VERCEL_TOKEN` / `Bearer $INGEST_TOKEN`. Not user-sessioned. |
 
 ### Files, diffs, PRs
 
-| Method | Path |
-|--------|------|
-| `GET` | `/api/tasks/[taskId]/files`, `/project-files`, `/file-content?filename&mode=local|remote`, `/diff?filename&mode=local`, `/sync-changes`, `/sync-pr`, `/clear-logs`, `/save-file`, `/create-file`, `/create-folder`, `/delete-file`, `/file-operation`, `/discard-file-changes`, `/reset-changes`, `/autocomplete`, `/lsp`, `/deployment`, `/check-runs` |
-| `GET/POST` | `/api/tasks/[taskId]/pr`, `/close-pr`, `/reopen-pr`, `/merge-pr`, `/pr-comments` |
+| Method     | Path                                                                              |
+| ---------- | --------------------------------------------------------------------------------- | --------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- |
+| `GET`      | `/api/tasks/[taskId]/files`, `/project-files`, `/file-content?filename&mode=local | remote`, `/diff?filename&mode=local`, `/sync-changes`, `/sync-pr`, `/clear-logs`, `/save-file`, `/create-file`, `/create-folder`, `/delete-file`, `/file-operation`, `/discard-file-changes`, `/reset-changes`, `/autocomplete`, `/lsp`, `/deployment`, `/check-runs` |
+| `GET/POST` | `/api/tasks/[taskId]/pr`, `/close-pr`, `/reopen-pr`, `/merge-pr`, `/pr-comments`  |
 
 All operate on `PROJECT_DIR = /vercel/sandbox/project` inside the VM, or on GitHub via Octokit + the user's decrypted GitHub token (`getUserGitHubToken()`).
 
-### Cron
+### Cron Jobs
 
-| Method | Path | Description |
-|--------|------|-------------|
-| `GET` | `/api/cron/reap` | **Hobby cron** (`*/5 * * * *`, `maxDuration: 10`). Queries `tasks WHERE status='processing' AND updatedAt < now()-5m` (limit 20), tries `Sandbox.get()`, probes liveness, logs `Reaper could not reach sandbox` if needed. Authorized by `x-vercel-cron` or `Bearer $CRON_SECRET` / `Bearer $SANDBOX_VERCEL_TOKEN`; always allowed in non-production for manual testing (`curl -H "x-vercel-cron: 1" ...`). |
+Defined in `vercel.json`:
+
+```json
+{
+  "crons": [
+    { "path": "/api/cron/reap", "schedule": "*/5 * * * *" },
+    { "path": "/api/cron/audio", "schedule": "*/10 * * * *" },
+    { "path": "/api/cron/metrics", "schedule": "5 0 * * *" }
+  ]
+}
+```
+
+| Method | Path                | Schedule           | Description                                                                                                                                                                                                                    |
+| ------ | ------------------- | ------------------ | ------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------ |
+| `GET`  | `/api/cron/reap`    | Every 5 min        | Queries stale `processing` tasks (`updatedAt < now()-5m`), probes sandbox, logs if sandbox is gone. Authorized by `x-vercel-cron` or `Bearer $CRON_SECRET` / `Bearer $SANDBOX_VERCEL_TOKEN`; always allowed in non-production. |
+| `GET`  | `/api/cron/audio`   | Every 10 min       | Finds one completed task without an audio summary, generates it. Authorized by `x-vercel-cron` or `Bearer` token.                                                                                                              |
+| `GET`  | `/api/cron/metrics` | Daily at 00:05 UTC | Aggregates yesterday's task counts into `metrics_daily` table. Authorized by `x-vercel-cron` or `Bearer` token.                                                                                                                |
+
+Manual test (dev only):
+
+```bash
+curl -H "x-vercel-cron: 1" http://localhost:3000/api/cron/reap
+```
+
+Vercel Hobby allows a maximum of **3 crons**. This project uses all 3.
 
 ### Webhooks
 
-| Method | Path | Description |
-|--------|------|-------------|
+| Method | Path                   | Description                                                                                                                                                                                                                                                                                                       |
+| ------ | ---------------------- | ----------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- |
 | `POST` | `/api/webhooks/github` | Jules trigger. Verifies `x-hub-signature-256` with `GITHUB_WEBHOOK_SECRET`, records `webhook_events`, extracts `prompt` from `issue.body` or `/jules <prompt>` in `issue_comment`, creates a DB `task` (`selectedAgent: 'gateway'`). Requires `WEBHOOK_DEFAULT_USER_ID` to attribute the task. `maxDuration: 10`. |
 
 ### Keys & Connectors
 
-| Method | Path | Description |
-|--------|------|-------------|
-| `GET/POST/DELETE` | `/api/api-keys` | CRUD `keys` (`provider: 'aigateway'|'anthropic'|'openai'|'cursor'|'gemini'`, encrypted via `lib/crypto.ts`). UI emphasizes Gateway. |
-| `GET` | `/api/api-keys/check?agent=&model=` | Returns `{ hasKey, provider, agentName }` — now Gateway-centric (all agents route through `aigateway` unless `copilot` with `getUserGitHubToken()`). |
-| `GET/POST/DELETE` | `/api/connectors` | MCP servers for Claude (`local`/`remote`, encrypted `env`/`oauthClientSecret`). |
-| `GET` | `/api/auth/*`, `/api/github/*`, `/api/vercel/teams`, `/api/github-stars` | OAuth, GitHub proxies, team picker, cached stars. |
+| Method            | Path                                                                     | Description                                                                                                                                          |
+| ----------------- | ------------------------------------------------------------------------ | ---------------------------------------------------------------------------------------------------------------------------------------------------- | ----------- | -------- | -------- | ----------------------------------------------------------------- |
+| `GET/POST/DELETE` | `/api/api-keys`                                                          | CRUD `keys` (`provider: 'aigateway'                                                                                                                  | 'anthropic' | 'openai' | 'cursor' | 'gemini'`, encrypted via `lib/crypto.ts`). UI emphasizes Gateway. |
+| `GET`             | `/api/api-keys/check?agent=&model=`                                      | Returns `{ hasKey, provider, agentName }` — now Gateway-centric (all agents route through `aigateway` unless `copilot` with `getUserGitHubToken()`). |
+| `GET/POST/DELETE` | `/api/connectors`                                                        | MCP servers for Claude (`local`/`remote`, encrypted `env`/`oauthClientSecret`).                                                                      |
+| `GET`             | `/api/auth/*`, `/api/github/*`, `/api/vercel/teams`, `/api/github-stars` | OAuth, GitHub proxies, team picker, cached stars.                                                                                                    |
 
 ## GitHub Webhook — `/jules` Trigger
 
@@ -301,26 +405,9 @@ curl -X POST https://<host>/api/webhooks/github \
 
 Add ` -H "X-Hub-Signature-256: sha256=..."` when `GITHUB_WEBHOOK_SECRET` is set.
 
-## Cron Reaper
-
-Defined in `vercel.json`:
-
-```json
-{ "crons": [{ "path": "/api/cron/reap", "schedule": "*/5 * * * *" }] }
-```
-
-- Queries stale `processing` tasks (`updatedAt < now()-5m`, limit 20).
-- For each `sandboxId`, calls `Sandbox.get({ sandboxId, teamId, projectId, token })`, then `sandbox.runCommand('sh', ['-c', 'ps aux | head ...; git status --porcelain'])`.
-- If the VM is gone, logs `Reaper could not reach sandbox` via `createTaskLogger` (no data leak — static string).
-- Update this handler as you add richer healing (e.g., re-queue, timeout → `error`, auto-PR).
-
-Trigger manually in dev:
-
-```bash
-curl -H "x-vercel-cron: 1" http://localhost:3000/api/cron/reap
-```
-
 ## Task & Database Model
+
+> For the complete database schema, see [Database Schema](./docs/database.md).
 
 ### `tasks`
 
@@ -334,25 +421,60 @@ gatewayModel?                     // canonical Gateway model string (new)
 installDependencies?  default false
 maxDuration       default 60      // was 300 (MAX_SANDBOX_DURATION)
 keepAlive?, enableBrowser?
-status  'pending'|'processing'|'completed'|'error'|'stopped' default 'pending'
+status  'pending'|'processing'|'awaiting_approval'|'completed'|'error'|'stopped' default 'pending'
+
+> `awaiting_approval` (new) — plan generated, waiting for user approval.
+> Flow: pending → processing → awaiting_approval → processing → completed | error | stopped
+> `error → (retry) → pending` for retrying failed/stopped tasks.
+
 progress 0-100, logs jsonb LogEntry[], error?
 branchName?, sandboxId?, agentSessionId?, sandboxUrl?, previewUrl?
 prUrl?, prNumber?, prStatus? 'open'|'closed'|'merged', prMergeCommitSha?
 mcpServerIds? jsonb string[]
 webhookSource? jsonb  {}          // new — event/deliveryId
 ingestCursor? timestamp           // new — last ingest write
+parentTaskId? text FK → tasks.id  // new — for retry chains
+autoFixAttempt  integer  default 0  // new — retry count for CI auto-fix
 createdAt, updatedAt, completedAt?, deletedAt? (soft delete)
 ```
 
-`webhook_events` (new) records every incoming webhook plus the task it spawned:
+### `plans` (new — migration 0023)
 
 ```
-id PK, provider, eventType, payload jsonb, taskId FK → tasks.id (SET NULL), createdAt
+id PK, taskId FK → tasks.id (CASCADE), version integer default 1,
+content jsonb (Zod-validated against planSchema),
+authoredBy 'agent'|'user', createdAt
 ```
 
-Other tables unchanged: `users` (`UNIQUE(provider, externalId)`), `accounts` (linked GitHub for Vercel users, `UNIQUE(userId, provider)`), `keys` (`UNIQUE(userId, provider)` with `enum ['anthropic','openai','cursor','gemini','aigateway']`), `task_messages` (`taskId FK CASCADE`, `role 'user'|'agent'`), `connectors`, `settings`.
+### `steering_messages` (new — migration 0025)
 
-Migrations live in `lib/db/migrations/` and are tracked in `lib/db/migrations/meta/_journal.json`. The Jules changes are in `0022_swift_black_crow.sql` (generated via `pnpm db:generate`; run via `pnpm db:push`).
+```
+id PK, taskId FK → tasks.id (CASCADE), seq integer, body text,
+appliedAt timestamp?, createdAt
+```
+
+### `audio_summaries` (new — migration 0026)
+
+```
+id PK, taskId FK → tasks.id (CASCADE), blobUrl, transcript, durationSec?,
+modelVersion, diffHash?, createdAt
+```
+
+### `pr_checks` (new — migration 0028)
+
+```
+id PK, taskId FK → tasks.id (CASCADE), checkRunId unique, conclusion, createdAt
+```
+
+### `metrics_daily` (new — migration 0029)
+
+```
+date PK, workspaceId?, tasksCreated, tasksCompleted, tasksFailed, totalCostCents
+```
+
+Other tables: `users` (`UNIQUE(provider, externalId)`), `accounts` (linked GitHub for Vercel users, `UNIQUE(userId, provider)`), `keys` (`UNIQUE(userId, provider)` with `enum ['anthropic','openai','cursor','gemini','aigateway']`), `task_messages` (`taskId FK CASCADE`, `role 'user'|'agent'`), `connectors`, `settings`, `webhook_events`.
+
+Migrations live in `lib/db/migrations/` and are tracked in `lib/db/migrations/meta/_journal.json`. The latest migrations (`0023`–`0029`) add plans, task states, steering messages, audio summaries, task parent hierarchy, PR checks, and metrics tables.
 
 ## Security
 
@@ -423,15 +545,18 @@ components/
   task-form.tsx        # Gateway-only model matrix (gateway/claude/codex via Gateway)
   api-keys-dialog.tsx  # Gateway required, legacy providers collapsed
   home-page-content.tsx# calls /start immediately after /tasks
-  task-details.tsx, task-chat.tsx, logs-pane.tsx, file-browser.tsx, ...
+  task-details.tsx, task-chat.tsx, logs-pane.tsx, file-browser.tsx,
+  plan-editor.tsx, steer-input.tsx, audio-player.tsx         # UI for plan editing, steering, audio
   connectors/, auth/, ui/, logos/, icons/
 lib/
   constants.ts         # GATEWAY_BASE_URL, GATEWAY_DEFAULT_MODEL, GATEWAY_MODELS
-  db/schema.ts         # tasks (+gatewayModel, webhookSource, ingestCursor), webhook_events
+  db/schema.ts         # tasks (+gatewayModel, webhookSource, ingestCursor, parentTaskId, autoFixAttempt, plans, steering_messages, audio_summaries, pr_checks, metrics_daily)
   db/client.ts, db/migrations/, db/users.ts, db/settings.ts
   sandbox/
     creation.ts        # Sandbox.create({ vcpus:2, timeout, clone, deps, branch })
-    orchestrator.ts    # runTaskAsync() — agent → pushChangesToBranch → status
+    orchestrator.ts    # runPlannerPhase() + runExecutionPhase() + runTaskAsync()
+    planner.ts         # runPlannerInSandbox — Gemini Pro read-only planning agent
+    prompts/planner-system-prompt.md  # System prompt for the planner
     agents/
       index.ts         # AgentType gateway|claude|codex (+legacy gated)
       gateway.ts       # native Gateway agent (ai SDK + sandbox tools) — new
@@ -442,8 +567,11 @@ lib/
   utils/
     branch-name-generator.ts, title-generator.ts, commit-message-generator.ts # generateText('openai/gpt-5-nano') via Gateway
     task-logger.ts, logging.ts, rate-limit.ts, cookies.ts, id.ts
+    errors.ts          # AppError, PlanSchemaError, SteerThrottledError, etc.
+  plans/schema.ts      # Zod plan schema (goal, assumptions, steps, risk)
+  audio/               # Audio summary generation (generate-summary.ts)
   session/, jwe/, crypto.ts, github/, vercel-client/, api-keys/, atoms/, hooks/
-public/, scripts/, opensrc/
+public/, scripts/, opensrc/, docs/
 ```
 
 ## Troubleshooting
@@ -456,16 +584,16 @@ public/, scripts/, opensrc/
 
 ## What Changed from the Upstream Template
 
-| Area | Upstream | This fork |
-|------|----------|-----------|
-| Inference | 6 provider matrix (Anthropic/OpenAI/Cursor/Gemini/Bearer×keys) | Gateway-only (`AI_GATEWAY_API_KEY` → `https://ai-gateway.vercel.sh`); Claude & Codex routed via `ANTHROPIC_BASE_URL` / `model_provider=vercel-ai-gateway`; new native `gateway` agent |
-| Task creation | `after()` x3 (branch/title + `processTaskWithTimeout` `Promise.race(timeout)`) — holds `maxDuration: 300` function | Bounded sync: fallback branch/title immediately + `Promise.race(..., 3500ms)` upgrade; no `after()`; ≤3.5s `201` |
-| Execution | `processTask` / `continueTask` inside `after()` | `lib/sandbox/orchestrator.ts:runTaskAsync()` + `POST /api/tasks/[id]/start` (Hobby `10s`) and `POST /api/tasks/[id]/continue` (existing flow preserved) |
-| Sandbox | `vcpus: 4`, `MAX_SANDBOX_DURATION 300` | `vcpus: 2`, `MAX_SANDBOX_DURATION 60` (plus `lib/constants.ts:GATEWAY_*`) |
-| Vercel | `vercel.json { maxDuration: 300, crons: [] }` | `{ maxDuration: 10 (×4 routes), crons: [{ path: "/api/cron/reap", schedule: "*/5 * * * *" }] }` |
-| DB | `tasks: { selectedAgent default 'claude', maxDuration default 300 }` | `+gatewayModel, +webhookSource, +ingestCursor`, default `gateway`/`60`, new `webhook_events` (migration `0022_swift_black_crow`) |
-| UI | 6 agents + per-provider key checks | Gateway-only picker (`gateway`/`claude`/`codex` all via Gateway), single Gateway key input, auto-`POST /start` |
-| New routes | — | `POST /api/tasks/[id]/start`, `POST /api/tasks/[id]/ingest-logs`, `GET /api/cron/reap`, `POST /api/webhooks/github` |
+| Area          | Upstream                                                                                                           | This fork                                                                                                                                                                                                                                                                                                                  |
+| ------------- | ------------------------------------------------------------------------------------------------------------------ | -------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- |
+| Inference     | 6 provider matrix (Anthropic/OpenAI/Cursor/Gemini/Bearer×keys)                                                     | Gateway-only (`AI_GATEWAY_API_KEY` → `https://ai-gateway.vercel.sh`); Claude & Codex routed via `ANTHROPIC_BASE_URL` / `model_provider=vercel-ai-gateway`; new native `gateway` agent                                                                                                                                      |
+| Task creation | `after()` x3 (branch/title + `processTaskWithTimeout` `Promise.race(timeout)`) — holds `maxDuration: 300` function | Bounded sync: fallback branch/title immediately + `Promise.race(..., 3500ms)` upgrade; no `after()`; ≤3.5s `201`                                                                                                                                                                                                           |
+| Execution     | `processTask` / `continueTask` inside `after()`                                                                    | `lib/sandbox/orchestrator.ts:runPlannerPhase()` + `runExecutionPhase()` + `POST /api/tasks/[id]/start` (Hobby `10s`) and `POST /api/tasks/[id]/continue` (existing flow preserved)                                                                                                                                         |
+| Sandbox       | `vcpus: 4`, `MAX_SANDBOX_DURATION 300`                                                                             | `vcpus: 2`, `MAX_SANDBOX_DURATION 60` (plus `lib/constants.ts:GATEWAY_*`)                                                                                                                                                                                                                                                  |
+| Vercel        | `vercel.json { maxDuration: 300, crons: [] }`                                                                      | `{ maxDuration: 10 (×all routes), crons: [reap @ 5min, audio @ 10min, metrics @ daily 00:05 UTC] }`                                                                                                                                                                                                                        |
+| DB            | `tasks: { selectedAgent default 'claude', maxDuration default 300 }`                                               | `+gatewayModel, +webhookSource, +ingestCursor, +parentTaskId, +autoFixAttempt`, default `gateway`/`60`, `awaiting_approval` status, new tables `plans`, `steering_messages`, `audio_summaries`, `pr_checks`, `metrics_daily` (migrations `0022`–`0029`)                                                                    |
+| UI            | 6 agents + per-provider key checks                                                                                 | Gateway-focused picker (`gateway`/`claude`/`codex` all via Gateway), single Gateway key input, auto-`POST /start`, PlanEditor, SteerInput, AudioPlayer, Retry button                                                                                                                                                       |
+| New routes    | —                                                                                                                  | `POST /api/tasks/[id]/start`, `POST /api/tasks/[id]/ingest-logs`, `POST /api/tasks/[id]/plan`, `POST /api/tasks/[id]/approve`, `POST /api/tasks/[id]/steer`, `POST /api/tasks/[id]/audio`, `POST /api/tasks/[id]/retry`, `GET /api/cron/reap`, `GET /api/cron/audio`, `GET /api/cron/metrics`, `POST /api/webhooks/github` |
 
 ## License
 

@@ -236,14 +236,12 @@ export async function POST(req: NextRequest) {
     // check_run not actionable — record pr_check for idempotency if needed
     if (checkRun) {
       try {
-        await db
-          .insert(prChecks)
-          .values({
-            id: generateId(12),
-            taskId: eventId,
-            checkRunId: String(checkRun.id),
-            conclusion: checkRun.conclusion || 'unknown',
-          })
+        await db.insert(prChecks).values({
+          id: generateId(12),
+          taskId: eventId,
+          checkRunId: String(checkRun.id),
+          conclusion: checkRun.conclusion || 'unknown',
+        })
       } catch {}
     }
     return NextResponse.json({ ok: true, ignored: true, event })
