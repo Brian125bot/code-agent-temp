@@ -37,11 +37,11 @@
   "crons": [
     {
       "path": "/api/cron/reap",
-      "schedule": "*/5 * * * *"
+      "schedule": "0 0 * * *"
     },
     {
       "path": "/api/cron/audio",
-      "schedule": "*/10 * * * *"
+      "schedule": "0 1 * * *"
     },
     {
       "path": "/api/cron/metrics",
