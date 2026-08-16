@@ -6,6 +6,11 @@ import { TaskDetails } from '@/components/task-details'
 import { SharedHeader } from '@/components/shared-header'
 import { TaskActions } from '@/components/task-actions'
 import { LogsPane } from '@/components/logs-pane'
+import { PlanEditor } from '@/components/plan-editor'
+import { AudioPlayer } from '@/components/audio-player'
+import { Button } from '@/components/ui/button'
+import { toast } from 'sonner'
+import { RotateCcw, Loader2 } from 'lucide-react'
 import type { Session } from '@/lib/session/types'
 
 interface TaskPageClientProps {
@@ -40,8 +45,9 @@ export function TaskPageClient({
   initialStars = 1200,
   maxSandboxDuration = 300,
 }: TaskPageClientProps) {
-  const { task, isLoading, error } = useTask(taskId)
-  const [logsPaneHeight, setLogsPaneHeight] = useState(40) // Default to collapsed height
+  const { task, plan, audioSummary, isLoading, error, refetch } = useTask(taskId)
+  const [logsPaneHeight, setLogsPaneHeight] = useState(40)
+  const [retrying, setRetrying] = useState(false)
 
   const repoInfo = useMemo(() => parseRepoFromUrl(task?.repoUrl ?? null), [task?.repoUrl])
 
@@ -52,6 +58,24 @@ export function TaskPageClient({
       </h1>
     </div>
   ) : null
+
+  const handleRetry = async () => {
+    setRetrying(true)
+    try {
+      const res = await fetch(`/api/tasks/${taskId}/retry`, { method: 'POST' })
+      const data = await res.json()
+      if (!res.ok) {
+        toast.error(data.error || 'Failed to retry')
+        return
+      }
+      toast.success('Task retry started')
+      refetch()
+    } catch {
+      toast.error('Failed to retry')
+    } finally {
+      setRetrying(false)
+    }
+  }
 
   if (isLoading) {
     return (
@@ -91,12 +115,39 @@ export function TaskPageClient({
         />
       </div>
 
-      {/* Task details */}
+      {plan && (
+        <div className="px-3 py-2 flex-shrink-0">
+          <PlanEditor taskId={taskId} plan={plan} taskStatus={task.status} onUpdated={refetch} onApproved={refetch} />
+        </div>
+      )}
+
+      {task.status === 'awaiting_approval' && !plan && (
+        <div className="px-3 py-2 flex-shrink-0">
+          <div className="flex items-center gap-2 text-sm text-muted-foreground">
+            <Loader2 className="h-4 w-4 animate-spin" /> Generating plan...
+          </div>
+        </div>
+      )}
+
+      {(task.status === 'error' || task.status === 'stopped') && (
+        <div className="px-3 py-2">
+          <Button size="sm" variant="outline" onClick={handleRetry} disabled={retrying}>
+            {retrying ? <Loader2 className="h-4 w-4 mr-1 animate-spin" /> : <RotateCcw className="h-4 w-4 mr-1" />}{' '}
+            Retry
+          </Button>
+        </div>
+      )}
+
+      {task.status === 'completed' && (
+        <div className="px-3 py-2">
+          <AudioPlayer taskId={taskId} initialAudio={audioSummary} />
+        </div>
+      )}
+
       <div className="flex-1 flex flex-col min-h-0 overflow-hidden" style={{ paddingBottom: `${logsPaneHeight}px` }}>
         <TaskDetails task={task} maxSandboxDuration={maxSandboxDuration} />
       </div>
 
-      {/* Logs pane at bottom */}
       <LogsPane task={task} onHeightChange={setLogsPaneHeight} />
     </div>
   )

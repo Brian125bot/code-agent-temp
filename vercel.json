@@ -6,7 +6,28 @@
     "app/api/tasks/[taskId]/start/route.ts": {
       "maxDuration": 10
     },
+    "app/api/tasks/[taskId]/plan/route.ts": {
+      "maxDuration": 10
+    },
+    "app/api/tasks/[taskId]/approve/route.ts": {
+      "maxDuration": 10
+    },
+    "app/api/tasks/[taskId]/steer/route.ts": {
+      "maxDuration": 10
+    },
+    "app/api/tasks/[taskId]/audio/route.ts": {
+      "maxDuration": 10
+    },
+    "app/api/tasks/[taskId]/retry/route.ts": {
+      "maxDuration": 10
+    },
     "app/api/cron/reap/route.ts": {
+      "maxDuration": 10
+    },
+    "app/api/cron/audio/route.ts": {
+      "maxDuration": 10
+    },
+    "app/api/cron/metrics/route.ts": {
       "maxDuration": 10
     },
     "app/api/webhooks/github/route.ts": {
@@ -17,6 +38,14 @@
     {
       "path": "/api/cron/reap",
       "schedule": "*/5 * * * *"
+    },
+    {
+      "path": "/api/cron/audio",
+      "schedule": "*/10 * * * *"
+    },
+    {
+      "path": "/api/cron/metrics",
+      "schedule": "5 0 * * *"
     }
   ]
 }

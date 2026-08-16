@@ -56,6 +56,9 @@ import { FileDiffViewer } from '@/components/file-diff-viewer'
 import { CreatePRDialog } from '@/components/create-pr-dialog'
 import { MergePRDialog } from '@/components/merge-pr-dialog'
 import { TaskChat } from '@/components/task-chat'
+import { PlanEditor } from '@/components/plan-editor'
+import { SteerInput } from '@/components/steer-input'
+import { AudioPlayer } from '@/components/audio-player'
 import {
   AlertDialog,
   AlertDialogAction,

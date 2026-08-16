@@ -1,7 +1,7 @@
 import { NextRequest, NextResponse } from 'next/server'
 import { db } from '@/lib/db/client'
-import { tasks } from '@/lib/db/schema'
-import { eq, and, isNull } from 'drizzle-orm'
+import { tasks, plans, audioSummaries } from '@/lib/db/schema'
+import { eq, and, isNull, desc } from 'drizzle-orm'
 import { createTaskLogger } from '@/lib/utils/task-logger'
 import { killSandbox } from '@/lib/sandbox/sandbox-registry'
 import { getServerSession } from '@/lib/session/get-server-session'
@@ -30,7 +30,15 @@ export async function GET(request: NextRequest, { params }: RouteParams) {
       return NextResponse.json({ error: 'Task not found' }, { status: 404 })
     }
 
-    return NextResponse.json({ task: task[0] })
+    const planRows = await db.select().from(plans).where(eq(plans.taskId, taskId)).orderBy(desc(plans.version)).limit(1)
+    const audioRows = await db
+      .select()
+      .from(audioSummaries)
+      .where(eq(audioSummaries.taskId, taskId))
+      .orderBy(desc(audioSummaries.createdAt))
+      .limit(1)
+
+    return NextResponse.json({ task: task[0], plan: planRows[0] || null, audioSummary: audioRows[0] || null })
   } catch (error) {
     console.error('Error fetching task:', error)
     return NextResponse.json({ error: 'Failed to fetch task' }, { status: 500 })

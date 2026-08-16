@@ -25,6 +25,63 @@ import { useAtom } from 'jotai'
 import { taskChatInputAtomFamily } from '@/lib/atoms/task'
 import { DropdownMenu, DropdownMenuContent, DropdownMenuItem, DropdownMenuTrigger } from '@/components/ui/dropdown-menu'
 
+function SteerInputInline({ taskId }: { taskId: string }) {
+  const [msg, setMsg] = useState('')
+  const [sending, setSending] = useState(false)
+  const [cd, setCd] = useState(0)
+  useEffect(() => {
+    if (cd <= 0) return
+    const id = setInterval(() => setCd((c) => Math.max(0, c - 1)), 1000)
+    return () => clearInterval(id)
+  }, [cd])
+  const send = async () => {
+    const t = msg.trim()
+    if (!t || sending || cd > 0) return
+    setSending(true)
+    try {
+      const res = await fetch(`/api/tasks/${taskId}/steer`, {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({ message: t }),
+      })
+      const data = await res.json()
+      if (!res.ok) {
+        if (res.status === 429) {
+          toast.error('Too many steering messages — wait 5s')
+          setCd(5)
+        } else toast.error(data.error || 'Failed to steer')
+        return
+      }
+      setMsg('')
+      setCd(5)
+      toast.success('Steering message sent')
+    } catch {
+      toast.error('Failed to send steering message')
+    } finally {
+      setSending(false)
+    }
+  }
+  return (
+    <div className="flex gap-2">
+      <input
+        value={msg}
+        onChange={(e) => setMsg(e.target.value)}
+        onKeyDown={(e) => {
+          if (e.key === 'Enter' && !e.shiftKey) {
+            e.preventDefault()
+            send()
+          }
+        }}
+        placeholder="Steer the agent..."
+        className="flex-1 rounded border px-2 py-1.5 text-xs bg-background"
+      />
+      <Button size="sm" onClick={send} disabled={!msg.trim() || sending || cd > 0} className="h-8">
+        {sending ? <Loader2 className="h-3 w-3 animate-spin" /> : cd > 0 ? `Wait ${cd}s` : 'Steer'}
+      </Button>
+    </div>
+  )
+}
+
 interface TaskChatProps {
   taskId: string
   task: Task
@@ -974,172 +1031,198 @@ export function TaskChat({ taskId, task }: TaskChatProps) {
               </div>
 
               {/* Render agent messages in this group */}
-              {group.agentMessages.map((agentMessage) => (
-                <div key={agentMessage.id} className="mt-4">
-                  <div className="space-y-1">
-                    <div className="text-xs text-muted-foreground px-2">
-                      {!agentMessage.content.trim() && (task.status === 'processing' || task.status === 'pending')
-                        ? (() => {
-                            return (
-                              <div className="opacity-50">
-                                <div className="italic">Generating response...</div>
-                                <div className="text-right font-mono opacity-70 mt-1">
-                                  {formatDuration(group.userMessage.createdAt)}
+              {group.agentMessages.map((agentMessage) => {
+                const isStepLog =
+                  agentMessage.content.startsWith('[') &&
+                  agentMessage.content.includes(']') &&
+                  agentMessage.content.includes('→')
+                if (isStepLog) {
+                  const open = agentMessage.content.length > 300
+                  return (
+                    <div key={agentMessage.id} className="mt-2">
+                      <details className="rounded bg-muted/50 px-2 py-1.5">
+                        <summary className="cursor-pointer font-mono text-xs text-muted-foreground list-none flex items-center gap-1">
+                          <span className="truncate">{agentMessage.content.slice(0, 120)}</span>
+                          <span className="ml-auto text-[10px] opacity-50">expand</span>
+                        </summary>
+                        <pre className="mt-2 max-h-48 overflow-auto whitespace-pre-wrap break-words font-mono text-xs text-muted-foreground">
+                          {agentMessage.content}
+                        </pre>
+                      </details>
+                    </div>
+                  )
+                }
+                return (
+                  <div key={agentMessage.id} className="mt-4">
+                    <div className="space-y-1">
+                      <div className="text-xs text-muted-foreground px-2">
+                        {!agentMessage.content.trim() && (task.status === 'processing' || task.status === 'pending')
+                          ? (() => {
+                              return (
+                                <div className="opacity-50">
+                                  <div className="italic">Generating response...</div>
+                                  <div className="text-right font-mono opacity-70 mt-1">
+                                    {formatDuration(group.userMessage.createdAt)}
+                                  </div>
                                 </div>
-                              </div>
-                            )
-                          })()
-                        : (() => {
-                            // Determine if this is the last agent message
-                            const allAgentMessages = displayMessages.filter((m) => m.role === 'agent')
-                            const isLastAgentMessage =
-                              allAgentMessages.length > 0 &&
-                              allAgentMessages[allAgentMessages.length - 1].id === agentMessage.id
+                              )
+                            })()
+                          : (() => {
+                              // Determine if this is the last agent message
+                              const allAgentMessages = displayMessages.filter((m) => m.role === 'agent')
+                              const isLastAgentMessage =
+                                allAgentMessages.length > 0 &&
+                                allAgentMessages[allAgentMessages.length - 1].id === agentMessage.id
 
-                            const isAgentWorking = task.status === 'processing' || task.status === 'pending'
-                            const content = parseAgentMessage(agentMessage.content)
+                              const isAgentWorking = task.status === 'processing' || task.status === 'pending'
+                              const content = parseAgentMessage(agentMessage.content)
 
-                            // Pre-process content to mark the last tool call with a special marker
-                            let processedContent = content
-                            if (isAgentWorking && isLastAgentMessage) {
-                              // Find all tool calls (more comprehensive pattern)
-                              const toolCallRegex = /\n\n([A-Z][a-z]+(?:\s+[a-z]+)*:?\s+[^\n]+)/g
-                              const matches = Array.from(content.matchAll(toolCallRegex))
+                              // Pre-process content to mark the last tool call with a special marker
+                              let processedContent = content
+                              if (isAgentWorking && isLastAgentMessage) {
+                                // Find all tool calls (more comprehensive pattern)
+                                const toolCallRegex = /\n\n([A-Z][a-z]+(?:\s+[a-z]+)*:?\s+[^\n]+)/g
+                                const matches = Array.from(content.matchAll(toolCallRegex))
 
-                              // Filter to only actual tool calls
-                              const toolCallMatches = matches.filter((match) => {
-                                const text = match[1]
-                                return /^(?:Editing|Reading|Running|Listing|Executing|Searching|Finding|Grep)/i.test(
-                                  text,
-                                )
-                              })
+                                // Filter to only actual tool calls
+                                const toolCallMatches = matches.filter((match) => {
+                                  const text = match[1]
+                                  return /^(?:Editing|Reading|Running|Listing|Executing|Searching|Finding|Grep)/i.test(
+                                    text,
+                                  )
+                                })
 
-                              if (toolCallMatches.length > 0) {
-                                // Get the last match
-                                const lastMatch = toolCallMatches[toolCallMatches.length - 1]
-                                const lastToolCall = lastMatch[1]
-                                const lastIndex = lastMatch.index! + 2 // +2 for \n\n
-                                const endOfToolCall = lastIndex + lastToolCall.length
+                                if (toolCallMatches.length > 0) {
+                                  // Get the last match
+                                  const lastMatch = toolCallMatches[toolCallMatches.length - 1]
+                                  const lastToolCall = lastMatch[1]
+                                  const lastIndex = lastMatch.index! + 2 // +2 for \n\n
+                                  const endOfToolCall = lastIndex + lastToolCall.length
 
-                                // Check if there's any non-whitespace content after the last tool call
-                                const contentAfter = content.substring(endOfToolCall).trim()
+                                  // Check if there's any non-whitespace content after the last tool call
+                                  const contentAfter = content.substring(endOfToolCall).trim()
 
-                                // Only add the shimmer marker if there's no content after it
-                                if (!contentAfter) {
-                                  processedContent =
-                                    content.substring(0, lastIndex) +
-                                    '🔄SHIMMER🔄' +
-                                    lastToolCall +
-                                    content.substring(endOfToolCall)
+                                  // Only add the shimmer marker if there's no content after it
+                                  if (!contentAfter) {
+                                    processedContent =
+                                      content.substring(0, lastIndex) +
+                                      '🔄SHIMMER🔄' +
+                                      lastToolCall +
+                                      content.substring(endOfToolCall)
+                                  }
                                 }
                               }
-                            }
 
-                            return (
-                              <Streamdown
-                                components={{
-                                  code: ({ className, children, ...props }: React.ComponentPropsWithoutRef<'code'>) => (
-                                    <code className={`${className} !text-xs`} {...props}>
-                                      {children}
-                                    </code>
-                                  ),
-                                  pre: ({ children, ...props }: React.ComponentPropsWithoutRef<'pre'>) => (
-                                    <pre className="!text-xs" {...props}>
-                                      {children}
-                                    </pre>
-                                  ),
-                                  p: ({ children, ...props }: React.ComponentPropsWithoutRef<'p'>) => {
-                                    // Extract text from complex children structures
-                                    const childrenArray = Children.toArray(children)
-                                    const textParts: string[] = []
+                              return (
+                                <Streamdown
+                                  components={{
+                                    code: ({
+                                      className,
+                                      children,
+                                      ...props
+                                    }: React.ComponentPropsWithoutRef<'code'>) => (
+                                      <code className={`${className} !text-xs`} {...props}>
+                                        {children}
+                                      </code>
+                                    ),
+                                    pre: ({ children, ...props }: React.ComponentPropsWithoutRef<'pre'>) => (
+                                      <pre className="!text-xs" {...props}>
+                                        {children}
+                                      </pre>
+                                    ),
+                                    p: ({ children, ...props }: React.ComponentPropsWithoutRef<'p'>) => {
+                                      // Extract text from complex children structures
+                                      const childrenArray = Children.toArray(children)
+                                      const textParts: string[] = []
 
-                                    childrenArray.forEach((child) => {
-                                      if (typeof child === 'string') {
-                                        textParts.push(child)
-                                      } else if (isValidElement(child)) {
-                                        // It's a React element - keep it as-is, don't stringify
-                                        // This will be handled by React
-                                      }
-                                      // Skip plain objects entirely
-                                    })
-
-                                    const text = textParts.join('')
-                                    const hasShimmerMarker = text.includes('🔄SHIMMER🔄')
-                                    const isToolCall =
-                                      /^(🔄SHIMMER🔄)?(Editing|Reading|Running|Listing|Executing|Searching|Finding|Grep)/i.test(
-                                        text,
-                                      )
-
-                                    // Always remove the marker from display (global replace to catch all instances)
-                                    const displayText = text.replace(/🔄SHIMMER🔄/g, '')
-
-                                    // If we have React elements, also remove marker from string children
-                                    const hasReactElements = childrenArray.some((child) => isValidElement(child))
-                                    const cleanedChildren = hasReactElements
-                                      ? childrenArray
-                                          .map((child) =>
-                                            typeof child === 'string' ? child.replace(/🔄SHIMMER🔄/g, '') : child,
-                                          )
-                                          .filter((child) => typeof child === 'string' || isValidElement(child))
-                                      : displayText
-
-                                    return (
-                                      <p
-                                        className={
-                                          isToolCall
-                                            ? hasShimmerMarker
-                                              ? 'bg-gradient-to-r from-muted-foreground from-20% via-foreground/40 via-50% to-muted-foreground to-80% bg-clip-text text-transparent bg-[length:300%_100%] animate-[shimmer_1.5s_linear_infinite]'
-                                              : 'text-muted-foreground/60'
-                                            : ''
+                                      childrenArray.forEach((child) => {
+                                        if (typeof child === 'string') {
+                                          textParts.push(child)
+                                        } else if (isValidElement(child)) {
+                                          // It's a React element - keep it as-is, don't stringify
+                                          // This will be handled by React
                                         }
-                                        {...props}
-                                      >
-                                        {cleanedChildren}
-                                      </p>
-                                    )
-                                  },
-                                  ul: ({ children, ...props }: React.ComponentPropsWithoutRef<'ul'>) => (
-                                    <ul className="text-xs list-disc ml-4" {...props}>
-                                      {children}
-                                    </ul>
-                                  ),
-                                  ol: ({ children, ...props }: React.ComponentPropsWithoutRef<'ol'>) => (
-                                    <ol className="text-xs list-decimal ml-4" {...props}>
-                                      {children}
-                                    </ol>
-                                  ),
-                                  li: ({ children, ...props }: React.ComponentPropsWithoutRef<'li'>) => (
-                                    <li className="text-xs mb-2" {...props}>
-                                      {Children.toArray(children).filter(
-                                        (c) => typeof c === 'string' || isValidElement(c),
-                                      )}
-                                    </li>
-                                  ),
-                                }}
-                              >
-                                {processedContent}
-                              </Streamdown>
-                            )
-                          })()}
-                    </div>
-                    <div className="flex items-center gap-0.5 justify-end">
-                      {/* Show copy button only when task is complete */}
-                      {task.status !== 'processing' && task.status !== 'pending' && (
-                        <button
-                          onClick={() => handleCopyMessage(agentMessage.id, parseAgentMessage(agentMessage.content))}
-                          className="h-3.5 w-3.5 opacity-30 hover:opacity-70 flex items-center justify-center"
-                        >
-                          {copiedMessageId === agentMessage.id ? (
-                            <Check className="h-3 w-3" />
-                          ) : (
-                            <Copy className="h-3 w-3" />
-                          )}
-                        </button>
-                      )}
+                                        // Skip plain objects entirely
+                                      })
+
+                                      const text = textParts.join('')
+                                      const hasShimmerMarker = text.includes('🔄SHIMMER🔄')
+                                      const isToolCall =
+                                        /^(🔄SHIMMER🔄)?(Editing|Reading|Running|Listing|Executing|Searching|Finding|Grep)/i.test(
+                                          text,
+                                        )
+
+                                      // Always remove the marker from display (global replace to catch all instances)
+                                      const displayText = text.replace(/🔄SHIMMER🔄/g, '')
+
+                                      // If we have React elements, also remove marker from string children
+                                      const hasReactElements = childrenArray.some((child) => isValidElement(child))
+                                      const cleanedChildren = hasReactElements
+                                        ? childrenArray
+                                            .map((child) =>
+                                              typeof child === 'string' ? child.replace(/🔄SHIMMER🔄/g, '') : child,
+                                            )
+                                            .filter((child) => typeof child === 'string' || isValidElement(child))
+                                        : displayText
+
+                                      return (
+                                        <p
+                                          className={
+                                            isToolCall
+                                              ? hasShimmerMarker
+                                                ? 'bg-gradient-to-r from-muted-foreground from-20% via-foreground/40 via-50% to-muted-foreground to-80% bg-clip-text text-transparent bg-[length:300%_100%] animate-[shimmer_1.5s_linear_infinite]'
+                                                : 'text-muted-foreground/60'
+                                              : ''
+                                          }
+                                          {...props}
+                                        >
+                                          {cleanedChildren}
+                                        </p>
+                                      )
+                                    },
+                                    ul: ({ children, ...props }: React.ComponentPropsWithoutRef<'ul'>) => (
+                                      <ul className="text-xs list-disc ml-4" {...props}>
+                                        {children}
+                                      </ul>
+                                    ),
+                                    ol: ({ children, ...props }: React.ComponentPropsWithoutRef<'ol'>) => (
+                                      <ol className="text-xs list-decimal ml-4" {...props}>
+                                        {children}
+                                      </ol>
+                                    ),
+                                    li: ({ children, ...props }: React.ComponentPropsWithoutRef<'li'>) => (
+                                      <li className="text-xs mb-2" {...props}>
+                                        {Children.toArray(children).filter(
+                                          (c) => typeof c === 'string' || isValidElement(c),
+                                        )}
+                                      </li>
+                                    ),
+                                  }}
+                                >
+                                  {processedContent}
+                                </Streamdown>
+                              )
+                            })()}
+                      </div>
+                      <div className="flex items-center gap-0.5 justify-end">
+                        {/* Show copy button only when task is complete */}
+                        {task.status !== 'processing' && task.status !== 'pending' && (
+                          <button
+                            onClick={() => handleCopyMessage(agentMessage.id, parseAgentMessage(agentMessage.content))}
+                            className="h-3.5 w-3.5 opacity-30 hover:opacity-70 flex items-center justify-center"
+                          >
+                            {copiedMessageId === agentMessage.id ? (
+                              <Check className="h-3 w-3" />
+                            ) : (
+                              <Copy className="h-3 w-3" />
+                            )}
+                          </button>
+                        )}
+                      </div>
                     </div>
                   </div>
-                </div>
-              ))}
+                )
+              })}
             </div>
           )
         })}
@@ -1271,7 +1354,8 @@ export function TaskChat({ taskId, task }: TaskChatProps) {
 
       {/* Input Area (only for chat tab) */}
       {activeTab === 'chat' && (
-        <div className="flex-shrink-0 px-3 pb-3">
+        <div className="flex-shrink-0 px-3 pb-3 space-y-2">
+          {task.status === 'processing' && <SteerInputInline taskId={taskId} />}
           <div className="relative">
             <Textarea
               value={newMessage}

@@ -114,6 +114,38 @@ export async function POST(request: NextRequest) {
 
     const [updatedTask] = await db.select().from(tasks).where(eq(tasks.id, taskId)).limit(1)
 
+    if (validatedData.selectedAgent === 'gateway' && validatedData.repoUrl) {
+      const { after } = await import('next/server')
+      const taskIdCopy = taskId
+      const promptCopy = validatedData.prompt
+      const repoUrlCopy = validatedData.repoUrl
+      const maxDurationCopy = effectiveMaxDuration
+      const branchNameCopy = (updatedTask || newTask).branchName || fallbackBranch
+      after(async () => {
+        try {
+          const { getUserApiKeys } = await import('@/lib/api-keys/user-keys')
+          const { getUserGitHubToken } = await import('@/lib/github/user-token')
+          const { getGitHubUser } = await import('@/lib/github/client')
+          const apiKeys = await getUserApiKeys()
+          const githubToken = await getUserGitHubToken()
+          const githubUser = await getGitHubUser()
+          const { runPlannerPhase } = await import('@/lib/sandbox/orchestrator')
+          await runPlannerPhase(
+            taskIdCopy,
+            promptCopy,
+            repoUrlCopy,
+            maxDurationCopy,
+            githubToken,
+            githubUser,
+            apiKeys,
+            branchNameCopy,
+          )
+        } catch (error) {
+          console.error('Error starting planner phase:', error)
+        }
+      })
+    }
+
     return NextResponse.json({ task: updatedTask || newTask }, { status: 201 })
   } catch (error) {
     console.error('Error creating task:', error)

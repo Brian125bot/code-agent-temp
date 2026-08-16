@@ -1,4 +1,4 @@
-import { pgTable, text, timestamp, integer, jsonb, boolean, uniqueIndex } from 'drizzle-orm/pg-core'
+import { pgTable, text, timestamp, integer, jsonb, boolean, uniqueIndex, date } from 'drizzle-orm/pg-core'
 import { z } from 'zod'
 
 // Log entry types
@@ -89,7 +89,7 @@ export const tasks = pgTable('tasks', {
   keepAlive: boolean('keep_alive').default(false),
   enableBrowser: boolean('enable_browser').default(false),
   status: text('status', {
-    enum: ['pending', 'processing', 'completed', 'error', 'stopped'],
+    enum: ['pending', 'processing', 'completed', 'error', 'stopped', 'awaiting_approval'],
   })
     .notNull()
     .default('pending'),
@@ -110,6 +110,8 @@ export const tasks = pgTable('tasks', {
   mcpServerIds: jsonb('mcp_server_ids').$type<string[]>(),
   webhookSource: jsonb('webhook_source').$type<Record<string, unknown>>(),
   ingestCursor: timestamp('ingest_cursor'),
+  parentTaskId: text('parent_task_id'),
+  autoFixAttempt: integer('auto_fix_attempt').default(0).notNull(),
   createdAt: timestamp('created_at').defaultNow().notNull(),
   updatedAt: timestamp('updated_at').defaultNow().notNull(),
   completedAt: timestamp('completed_at'),
@@ -129,7 +131,7 @@ export const insertTaskSchema = z.object({
   maxDuration: z.number().default(parseInt(process.env.MAX_SANDBOX_DURATION || '60', 10)),
   keepAlive: z.boolean().default(false),
   enableBrowser: z.boolean().default(false),
-  status: z.enum(['pending', 'processing', 'completed', 'error', 'stopped']).default('pending'),
+  status: z.enum(['pending', 'processing', 'completed', 'error', 'stopped', 'awaiting_approval']).default('pending'),
   progress: z.number().min(0).max(100).default(0),
   logs: z.array(logEntrySchema).optional(),
   error: z.string().optional(),
@@ -145,6 +147,8 @@ export const insertTaskSchema = z.object({
   mcpServerIds: z.array(z.string()).optional(),
   webhookSource: z.record(z.string(), z.unknown()).optional(),
   ingestCursor: z.date().optional(),
+  parentTaskId: z.string().optional(),
+  autoFixAttempt: z.number().optional(),
   createdAt: z.date().optional(),
   updatedAt: z.date().optional(),
   completedAt: z.date().optional(),
@@ -164,7 +168,7 @@ export const selectTaskSchema = z.object({
   maxDuration: z.number().nullable(),
   keepAlive: z.boolean().nullable(),
   enableBrowser: z.boolean().nullable(),
-  status: z.enum(['pending', 'processing', 'completed', 'error', 'stopped']),
+  status: z.enum(['pending', 'processing', 'completed', 'error', 'stopped', 'awaiting_approval']),
   progress: z.number().nullable(),
   logs: z.array(logEntrySchema).nullable(),
   error: z.string().nullable(),
@@ -180,6 +184,8 @@ export const selectTaskSchema = z.object({
   mcpServerIds: z.array(z.string()).nullable(),
   webhookSource: z.record(z.string(), z.unknown()).nullable(),
   ingestCursor: z.date().nullable(),
+  parentTaskId: z.string().nullable(),
+  autoFixAttempt: z.number(),
   createdAt: z.date(),
   updatedAt: z.date(),
   completedAt: z.date().nullable(),
@@ -447,6 +453,75 @@ export const webhookEvents = pgTable('webhook_events', {
 
 export type WebhookEvent = typeof webhookEvents.$inferSelect
 export type InsertWebhookEvent = typeof webhookEvents.$inferInsert
+
+export const plans = pgTable('plans', {
+  id: text('id').primaryKey(),
+  taskId: text('task_id')
+    .notNull()
+    .references(() => tasks.id, { onDelete: 'cascade' }),
+  version: integer('version').notNull().default(1),
+  content: jsonb('content').notNull(),
+  authoredBy: text('authored_by', { enum: ['agent', 'user'] }).notNull(),
+  createdAt: timestamp('created_at').defaultNow().notNull(),
+})
+
+export type Plan = typeof plans.$inferSelect
+export type InsertPlan = typeof plans.$inferInsert
+
+export const steeringMessages = pgTable('steering_messages', {
+  id: text('id').primaryKey(),
+  taskId: text('task_id')
+    .notNull()
+    .references(() => tasks.id, { onDelete: 'cascade' }),
+  seq: integer('seq').notNull(),
+  body: text('body').notNull(),
+  appliedAt: timestamp('applied_at'),
+  createdAt: timestamp('created_at').defaultNow().notNull(),
+})
+
+export type SteeringMessage = typeof steeringMessages.$inferSelect
+export type InsertSteeringMessage = typeof steeringMessages.$inferInsert
+
+export const audioSummaries = pgTable('audio_summaries', {
+  id: text('id').primaryKey(),
+  taskId: text('task_id')
+    .notNull()
+    .references(() => tasks.id, { onDelete: 'cascade' }),
+  blobUrl: text('blob_url').notNull(),
+  transcript: text('transcript').notNull(),
+  durationSec: integer('duration_sec'),
+  modelVersion: text('model_version').notNull(),
+  diffHash: text('diff_hash'),
+  createdAt: timestamp('created_at').defaultNow().notNull(),
+})
+
+export type AudioSummary = typeof audioSummaries.$inferSelect
+export type InsertAudioSummary = typeof audioSummaries.$inferInsert
+
+export const prChecks = pgTable('pr_checks', {
+  id: text('id').primaryKey(),
+  taskId: text('task_id')
+    .notNull()
+    .references(() => tasks.id, { onDelete: 'cascade' }),
+  checkRunId: text('check_run_id').notNull().unique(),
+  conclusion: text('conclusion').notNull(),
+  createdAt: timestamp('created_at').defaultNow().notNull(),
+})
+
+export type PrCheck = typeof prChecks.$inferSelect
+export type InsertPrCheck = typeof prChecks.$inferInsert
+
+export const metricsDaily = pgTable('metrics_daily', {
+  date: date('date').primaryKey(),
+  workspaceId: text('workspace_id'),
+  tasksCreated: integer('tasks_created').default(0).notNull(),
+  tasksCompleted: integer('tasks_completed').default(0).notNull(),
+  tasksFailed: integer('tasks_failed').default(0).notNull(),
+  totalCostCents: integer('total_cost_cents').default(0).notNull(),
+})
+
+export type MetricsDaily = typeof metricsDaily.$inferSelect
+export type InsertMetricsDaily = typeof metricsDaily.$inferInsert
 
 export const userConnections = accounts
 export type UserConnection = Account

@@ -1,0 +1,2 @@
+- Prefers complete, comprehensive custom documentation that is written, committed, and published to the repo covering architecture, configuration, and API reference rather than minimal README. Confidence: 0.9
+- Prefers changes to be committed and pushed to remote after documentation/implementation is complete. Confidence: 0.82

@@ -1,10 +1,12 @@
 'use client'
 
 import { useState, useEffect, useCallback, useRef } from 'react'
-import { Task } from '@/lib/db/schema'
+import { Task, Plan, AudioSummary } from '@/lib/db/schema'
 
 export function useTask(taskId: string) {
   const [task, setTask] = useState<Task | null>(null)
+  const [plan, setPlan] = useState<Plan | null>(null)
+  const [audioSummary, setAudioSummary] = useState<AudioSummary | null>(null)
   const [isLoading, setIsLoading] = useState(true)
   const [error, setError] = useState<string | null>(null)
   const attemptCountRef = useRef(0)
@@ -18,6 +20,8 @@ export function useTask(taskId: string) {
       if (response.ok) {
         const data = await response.json()
         setTask(data.task)
+        if (data.plan !== undefined) setPlan(data.plan)
+        if (data.audioSummary !== undefined) setAudioSummary(data.audioSummary)
         setError(null)
         hasFoundTaskRef.current = true
       } else if (response.status === 404) {
@@ -102,5 +106,5 @@ export function useTask(taskId: string) {
     }
   }, [task, fetchTask])
 
-  return { task, isLoading, error, refetch: fetchTask }
+  return { task, plan, audioSummary, isLoading, error, refetch: fetchTask }
 }
