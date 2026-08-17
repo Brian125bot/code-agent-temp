@@ -1,0 +1,55 @@
+import type { Task } from '@/lib/db/schema'
+
+export function createMockTask(overrides: Partial<Task> = {}): Task {
+  return {
+    id: 'task_test123',
+    userId: 'user_test123',
+    prompt: 'Add user authentication to the app',
+    title: 'Add user authentication',
+    repoUrl: 'https://github.com/test/repo',
+    selectedAgent: 'gateway',
+    selectedModel: null,
+    gatewayModel: 'openai/gpt-5-nano',
+    installDependencies: true,
+    maxDuration: 60,
+    keepAlive: false,
+    enableBrowser: false,
+    status: 'pending',
+    progress: 0,
+    logs: [],
+    error: null,
+    branchName: 'feature/add-auth',
+    sandboxId: null,
+    agentSessionId: null,
+    sandboxUrl: null,
+    previewUrl: null,
+    prUrl: null,
+    prNumber: null,
+    prStatus: null,
+    prMergeCommitSha: null,
+    mcpServerIds: null,
+    webhookSource: null,
+    ingestCursor: null,
+    parentTaskId: null,
+    autoFixAttempt: 0,
+    createdAt: new Date('2024-01-01'),
+    updatedAt: new Date('2024-01-01'),
+    completedAt: null,
+    deletedAt: null,
+    ...overrides,
+  }
+}
+
+export const MOCK_TASKS = {
+  pending: createMockTask({ status: 'pending' }),
+  processing: createMockTask({ status: 'processing', sandboxId: 'sb_abc123' }),
+  completed: createMockTask({ status: 'completed', completedAt: new Date() }),
+  error: createMockTask({ status: 'error', error: 'Build failed' }),
+  stopped: createMockTask({ status: 'stopped' }),
+  awaitingApproval: createMockTask({ status: 'awaiting_approval' }),
+  stuckProcessing: createMockTask({
+    status: 'processing',
+    sandboxId: null,
+    updatedAt: new Date(Date.now() - 10 * 60 * 1000),
+  }),
+}
