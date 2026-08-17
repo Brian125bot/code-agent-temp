@@ -554,7 +554,12 @@ export function HomePageContent({
   return (
     <div className="flex-1 bg-background flex flex-col">
       <div className="p-3">
-        <SharedHeader leftActions={headerLeftActions} initialStars={initialStars} />
+        <SharedHeader
+          leftActions={headerLeftActions}
+          initialStars={initialStars}
+          hideStars={true}
+          hideDeployButton={true}
+        />
       </div>
 
       <div className="flex-1 flex items-center justify-center px-4 pb-20 md:pb-4">
@@ -570,9 +575,6 @@ export function HomePageContent({
           maxSandboxDuration={maxSandboxDuration}
         />
       </div>
-
-      {/* Mobile Footer with Stars and Deploy Button - Show when logged in OR when owner/repo are selected */}
-      {(user || selectedOwner || selectedRepo) && <HomePageMobileFooter initialStars={initialStars} />}
 
       {/* Dialogs */}
       <OpenRepoUrlDialog open={showOpenRepoDialog} onOpenChange={setShowOpenRepoDialog} onSubmit={handleOpenRepoUrl} />
