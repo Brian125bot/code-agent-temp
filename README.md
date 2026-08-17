@@ -4,7 +4,6 @@ An analogue of **Jules** — the asynchronous coding agent — rebuilt from the 
 
 Give it a repo + a task and it works **detached**: clones, branches, edits code inside a Vercel Sandbox VM, streams logs, pushes, and is wired for PR automation. No direct Anthropic/OpenAI/Gemini keys — every model call is routed through **AI Gateway** (`https://ai-gateway.vercel.sh`) with a single `AI_GATEWAY_API_KEY`.
 
-![Coding Agent Template Screenshot](screenshot.png)
 
 ## Table of Contents
 
