@@ -9,6 +9,8 @@ import { checkRateLimit } from '@/lib/utils/rate-limit'
 import { getMaxSandboxDuration } from '@/lib/db/settings'
 import { createFallbackBranchName } from '@/lib/utils/branch-name-generator'
 import { createFallbackTitle } from '@/lib/utils/title-generator'
+import { getAppUrl } from '@/lib/utils/app-url'
+import { healStuckTasksByUser } from '@/lib/utils/heal-stuck-tasks'
 
 export async function GET() {
   try {
@@ -16,6 +18,10 @@ export async function GET() {
     if (!session?.user?.id) {
       return NextResponse.json({ error: 'Unauthorized' }, { status: 401 })
     }
+
+    // Self-heal tasks that are stuck before sandbox creation
+    await healStuckTasksByUser(session.user.id)
+
     const userTasks = await db
       .select()
       .from(tasks)
@@ -115,35 +121,15 @@ export async function POST(request: NextRequest) {
     const [updatedTask] = await db.select().from(tasks).where(eq(tasks.id, taskId)).limit(1)
 
     if (validatedData.selectedAgent === 'gateway' && validatedData.repoUrl) {
-      const { after } = await import('next/server')
-      const taskIdCopy = taskId
-      const promptCopy = validatedData.prompt
-      const repoUrlCopy = validatedData.repoUrl
-      const maxDurationCopy = effectiveMaxDuration
-      const branchNameCopy = (updatedTask || newTask).branchName || fallbackBranch
-      after(async () => {
-        try {
-          const { getUserApiKeys } = await import('@/lib/api-keys/user-keys')
-          const { getUserGitHubToken } = await import('@/lib/github/user-token')
-          const { getGitHubUser } = await import('@/lib/github/client')
-          const apiKeys = await getUserApiKeys()
-          const githubToken = await getUserGitHubToken()
-          const githubUser = await getGitHubUser()
-          const { runPlannerPhase } = await import('@/lib/sandbox/orchestrator')
-          await runPlannerPhase(
-            taskIdCopy,
-            promptCopy,
-            repoUrlCopy,
-            maxDurationCopy,
-            githubToken,
-            githubUser,
-            apiKeys,
-            branchNameCopy,
-          )
-        } catch (error) {
-          console.error('Error starting planner phase:', error)
-        }
-      })
+      const runUrl = `${getAppUrl()}/api/internal/run-phase`
+      fetch(runUrl, {
+        method: 'POST',
+        headers: {
+          'content-type': 'application/json',
+          cookie: request.headers.get('cookie') || '',
+        },
+        body: JSON.stringify({ taskId, phase: 'planner' }),
+      }).catch((err) => console.error('Failed to trigger planner phase:', err))
     }
 
     return NextResponse.json({ task: updatedTask || newTask }, { status: 201 })

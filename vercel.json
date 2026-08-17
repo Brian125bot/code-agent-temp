@@ -21,6 +21,15 @@
     "app/api/tasks/[taskId]/retry/route.ts": {
       "maxDuration": 10
     },
+    "app/api/tasks/[taskId]/continue/route.ts": {
+      "maxDuration": 10
+    },
+    "app/api/internal/run-phase/route.ts": {
+      "maxDuration": 10
+    },
+    "app/api/cron/tick/route.ts": {
+      "maxDuration": 10
+    },
     "app/api/cron/reap/route.ts": {
       "maxDuration": 10
     },
@@ -36,16 +45,8 @@
   },
   "crons": [
     {
-      "path": "/api/cron/reap",
+      "path": "/api/cron/tick",
       "schedule": "0 0 * * *"
-    },
-    {
-      "path": "/api/cron/audio",
-      "schedule": "0 1 * * *"
-    },
-    {
-      "path": "/api/cron/metrics",
-      "schedule": "5 0 * * *"
     }
   ]
 }

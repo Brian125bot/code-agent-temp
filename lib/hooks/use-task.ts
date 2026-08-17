@@ -74,17 +74,20 @@ export function useTask(taskId: string) {
     // eslint-disable-next-line react-hooks/exhaustive-deps
   }, [taskId]) // fetchTask is intentionally not in deps to avoid recreating interval on every fetchTask change
 
-  // Poll for updates every 5 seconds after initial load
+  // Poll for updates: fast while task is active, slow when idle
   useEffect(() => {
     // Only start polling after we've found the task or given up
     if (!isLoading) {
+      const isActive = task?.status === 'processing' || task?.status === 'awaiting_approval'
+      const intervalMs = isActive ? 5000 : 30000
+
       const interval = setInterval(() => {
         fetchTask()
-      }, 5000)
+      }, intervalMs)
 
       return () => clearInterval(interval)
     }
-  }, [fetchTask, isLoading])
+  }, [fetchTask, isLoading, task?.status])
 
   // Watch for sandbox URL becoming available - trigger immediate refetch when logs indicate it's ready
   useEffect(() => {

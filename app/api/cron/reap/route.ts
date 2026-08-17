@@ -3,6 +3,7 @@ import { db } from '@/lib/db/client'
 import { tasks } from '@/lib/db/schema'
 import { eq, and, lt } from 'drizzle-orm'
 import { createTaskLogger } from '@/lib/utils/task-logger'
+import { healAllStuckTasks } from '@/lib/utils/heal-stuck-tasks'
 
 export const maxDuration = 10
 
@@ -20,6 +21,9 @@ export async function GET(req: NextRequest) {
     return NextResponse.json({ error: 'Unauthorized' }, { status: 401 })
   }
 
+  // Recover tasks that never created a sandbox (startup freeze)
+  const healedStartup = await healAllStuckTasks()
+
   const staleCutoff = new Date(Date.now() - 5 * 60 * 1000)
   const staleTasks = await db
     .select()
@@ -28,7 +32,7 @@ export async function GET(req: NextRequest) {
     .limit(20)
 
   let checked = 0
-  let recovered = 0
+  let recovered = healedStartup
 
   for (const task of staleTasks) {
     checked++
@@ -58,9 +62,18 @@ export async function GET(req: NextRequest) {
           output.toLowerCase().includes('node')
         if (!isStillRunning) {
           await logger.info('Reaper detected stalled task, marking for retry')
+          await db
+            .update(tasks)
+            .set({
+              status: 'error',
+              error: 'Task stalled during execution and was automatically marked as failed. Please retry.',
+              updatedAt: new Date(),
+              completedAt: new Date(),
+            })
+            .where(eq(tasks.id, task.id))
+          recovered++
         }
       }
-      void recovered
     } catch {
       const logger = createTaskLogger(task.id)
       await logger.info('Reaper could not reach sandbox')

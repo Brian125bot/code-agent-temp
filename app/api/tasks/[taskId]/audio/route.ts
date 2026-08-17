@@ -4,6 +4,7 @@ import { tasks, audioSummaries } from '@/lib/db/schema'
 import { eq, and, isNull, desc } from 'drizzle-orm'
 import { getServerSession } from '@/lib/session/get-server-session'
 import { AppError } from '@/lib/utils/errors'
+import { getAppUrl } from '@/lib/utils/app-url'
 
 export const maxDuration = 10
 
@@ -66,15 +67,15 @@ export async function POST(req: NextRequest, context: { params: Promise<{ taskId
       return NextResponse.json({ audio: existing[0], cached: true })
     }
 
-    const { after } = await import('next/server')
-    after(async () => {
-      try {
-        const { generateAudioSummary } = await import('@/lib/audio/generate-summary')
-        await generateAudioSummary(taskId)
-      } catch (error) {
-        console.error('Error generating audio:', error)
-      }
-    })
+    const runUrl = `${getAppUrl()}/api/internal/run-phase`
+    fetch(runUrl, {
+      method: 'POST',
+      headers: {
+        'content-type': 'application/json',
+        cookie: req.headers.get('cookie') || '',
+      },
+      body: JSON.stringify({ taskId, phase: 'audio' }),
+    }).catch((err) => console.error('Failed to trigger audio generation:', err))
 
     return NextResponse.json({ queued: true }, { status: 202 })
   } catch (error) {

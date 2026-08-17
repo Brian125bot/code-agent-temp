@@ -6,6 +6,7 @@ import { insertTaskSchema } from '@/lib/db/schema'
 import { generateId } from '@/lib/utils/id'
 import { createFallbackBranchName } from '@/lib/utils/branch-name-generator'
 import { createFallbackTitle } from '@/lib/utils/title-generator'
+import { getAppUrl } from '@/lib/utils/app-url'
 import { eq, and } from 'drizzle-orm'
 
 function verifySignature(payload: string, signature: string | null, secret: string): boolean {
@@ -191,30 +192,15 @@ export async function POST(req: NextRequest) {
             .set({ autoFixAttempt: attempt + 1 } as never)
             .where(eq(tasks.id, origTask.id))
 
-          const { after } = await import('next/server')
-          after(async () => {
-            try {
-              const { getUserApiKeys } = await import('@/lib/api-keys/user-keys')
-              const { getUserGitHubToken } = await import('@/lib/github/user-token')
-              const { getGitHubUser } = await import('@/lib/github/client')
-              const apiKeys = await getUserApiKeys()
-              const githubToken = await getUserGitHubToken()
-              const githubUser = await getGitHubUser()
-              const { runPlannerPhase } = await import('@/lib/sandbox/orchestrator')
-              await runPlannerPhase(
-                newId,
-                prompt,
-                origTask.repoUrl || repo || '',
-                origTask.maxDuration || 60,
-                githubToken,
-                githubUser,
-                apiKeys,
-                branchName,
-              )
-            } catch (error) {
-              console.error('Error starting auto-fix planner:', error)
-            }
-          })
+          const runUrl = `${getAppUrl()}/api/internal/run-phase`
+          fetch(runUrl, {
+            method: 'POST',
+            headers: {
+              'content-type': 'application/json',
+              'x-internal-secret': process.env.CRON_SECRET || process.env.SANDBOX_VERCEL_TOKEN || '',
+            },
+            body: JSON.stringify({ taskId: newId, phase: 'planner' }),
+          }).catch((err) => console.error('Failed to trigger auto-fix planner:', err))
 
           try {
             await db.insert(webhookEvents).values({
@@ -292,32 +278,15 @@ export async function POST(req: NextRequest) {
       })
       .catch(() => {})
 
-    const { after } = await import('next/server')
-    after(async () => {
-      try {
-        const { getUserApiKeys } = await import('@/lib/api-keys/user-keys')
-        const { getUserGitHubToken } = await import('@/lib/github/user-token')
-        const { getGitHubUser } = await import('@/lib/github/client')
-        const apiKeys = await getUserApiKeys()
-        const githubToken = await getUserGitHubToken()
-        const githubUser = await getGitHubUser()
-        const { getMaxSandboxDuration } = await import('@/lib/db/settings')
-        const maxDurationSetting = await getMaxSandboxDuration(fallbackUserId)
-        const { runPlannerPhase } = await import('@/lib/sandbox/orchestrator')
-        await runPlannerPhase(
-          taskId,
-          prompt,
-          repo,
-          maxDurationSetting,
-          githubToken,
-          githubUser,
-          apiKeys,
-          fallbackBranch,
-        )
-      } catch (error) {
-        console.error('Error starting webhook planner:', error)
-      }
-    })
+    const runUrl = `${getAppUrl()}/api/internal/run-phase`
+    fetch(runUrl, {
+      method: 'POST',
+      headers: {
+        'content-type': 'application/json',
+        'x-internal-secret': process.env.CRON_SECRET || process.env.SANDBOX_VERCEL_TOKEN || '',
+      },
+      body: JSON.stringify({ taskId, phase: 'planner' }),
+    }).catch((err) => console.error('Failed to trigger webhook planner:', err))
 
     return NextResponse.json({ ok: true, task: created }, { status: 201 })
   } catch (error) {

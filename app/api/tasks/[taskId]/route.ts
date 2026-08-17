@@ -5,6 +5,7 @@ import { eq, and, isNull, desc } from 'drizzle-orm'
 import { createTaskLogger } from '@/lib/utils/task-logger'
 import { killSandbox } from '@/lib/sandbox/sandbox-registry'
 import { getServerSession } from '@/lib/session/get-server-session'
+import { healStuckTaskById } from '@/lib/utils/heal-stuck-tasks'
 
 interface RouteParams {
   params: Promise<{
@@ -20,6 +21,10 @@ export async function GET(request: NextRequest, { params }: RouteParams) {
     }
 
     const { taskId } = await params
+
+    // Self-heal tasks that are stuck before sandbox creation
+    await healStuckTaskById(taskId)
+
     const task = await db
       .select()
       .from(tasks)

@@ -4,6 +4,7 @@ import { tasks } from '@/lib/db/schema'
 import { eq, and, isNull } from 'drizzle-orm'
 import { getServerSession } from '@/lib/session/get-server-session'
 import { AppError } from '@/lib/utils/errors'
+import { getAppUrl } from '@/lib/utils/app-url'
 
 export const maxDuration = 10
 
@@ -31,15 +32,15 @@ export async function POST(req: NextRequest, context: { params: Promise<{ taskId
       .set({ status: 'processing', updatedAt: new Date() } as never)
       .where(eq(tasks.id, taskId))
 
-    const { after } = await import('next/server')
-    after(async () => {
-      try {
-        const { runExecutionPhase } = await import('@/lib/sandbox/orchestrator')
-        await runExecutionPhase(taskId)
-      } catch (error) {
-        console.error('Error in execution phase:', error)
-      }
-    })
+    const runUrl = `${getAppUrl()}/api/internal/run-phase`
+    fetch(runUrl, {
+      method: 'POST',
+      headers: {
+        'content-type': 'application/json',
+        cookie: req.headers.get('cookie') || '',
+      },
+      body: JSON.stringify({ taskId, phase: 'execution' }),
+    }).catch((err) => console.error('Failed to trigger execution phase:', err))
 
     return NextResponse.json({ ok: true })
   } catch (error) {

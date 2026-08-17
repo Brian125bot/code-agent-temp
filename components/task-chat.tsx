@@ -321,13 +321,15 @@ export function TaskChat({ taskId, task }: TaskChatProps) {
   useEffect(() => {
     fetchMessages(true) // Show loading on initial fetch
 
-    // Poll for new messages every 3 seconds without showing loading state
+    // Poll fast while task is active, slow otherwise to stay within Hobby limits
+    const isActive = task?.status === 'processing'
+    const intervalMs = isActive ? 5000 : 30000
     const interval = setInterval(() => {
       fetchMessages(false) // Don't show loading on polls
-    }, 3000)
+    }, intervalMs)
 
     return () => clearInterval(interval)
-  }, [fetchMessages])
+  }, [fetchMessages, task?.status])
 
   // Auto-refresh for active tab (Comments, Checks, Deployments)
   useEffect(() => {

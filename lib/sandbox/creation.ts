@@ -9,6 +9,13 @@ import { TaskLogger } from '@/lib/utils/task-logger'
 import { detectPackageManager, installDependencies } from './package-manager'
 import { registerSandbox } from './sandbox-registry'
 
+function withTimeout<T>(promise: Promise<T>, ms: number, label: string): Promise<T> {
+  return Promise.race([
+    promise,
+    new Promise<T>((_, reject) => setTimeout(() => reject(new Error(`${label} timed out after ${ms}ms`)), ms)),
+  ])
+}
+
 // Helper function to run command and log it
 async function runAndLogCommand(sandbox: Sandbox, command: string, args: string[], logger: TaskLogger, cwd?: string) {
   // Properly escape arguments for shell execution
@@ -96,7 +103,7 @@ export async function createSandbox(config: SandboxConfig, logger: TaskLogger): 
 
     let sandbox: Sandbox
     try {
-      sandbox = await Sandbox.create(sandboxConfig)
+      sandbox = await withTimeout(Sandbox.create(sandboxConfig), 8000, 'Sandbox.create')
       await logger.info('Sandbox created successfully')
 
       // Register the sandbox immediately for potential killing
@@ -149,9 +156,9 @@ export async function createSandbox(config: SandboxConfig, logger: TaskLogger): 
 
       // Check if this is a timeout error
       if (errorMessage?.includes('timeout') || errorCode === 'ETIMEDOUT' || errorName === 'TimeoutError') {
-        await logger.error(`Sandbox creation timed out after 5 minutes`)
-        await logger.error(`This usually happens when the repository is large or has many dependencies`)
-        throw new Error('Sandbox creation timed out. Try with a smaller repository or fewer dependencies.')
+        await logger.error('Sandbox creation timed out')
+        await logger.error('This usually happens when the repository is large or has many dependencies')
+        throw new Error('Sandbox creation timed out, please retry')
       }
 
       await logger.error('Sandbox creation failed')

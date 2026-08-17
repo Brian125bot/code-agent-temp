@@ -4,6 +4,7 @@ import { tasks } from '@/lib/db/schema'
 import { eq, and, isNull } from 'drizzle-orm'
 import { getServerSession } from '@/lib/session/get-server-session'
 import { AppError } from '@/lib/utils/errors'
+import { getAppUrl } from '@/lib/utils/app-url'
 
 export const maxDuration = 10
 
@@ -34,52 +35,15 @@ export async function POST(req: NextRequest, context: { params: Promise<{ taskId
       .set({ status: 'pending' as never, error: null, progress: 0, updatedAt: new Date(), completedAt: null } as never)
       .where(eq(tasks.id, taskId))
 
-    const { after } = await import('next/server')
-    after(async () => {
-      try {
-        const { getUserApiKeys } = await import('@/lib/api-keys/user-keys')
-        const { getUserGitHubToken } = await import('@/lib/github/user-token')
-        const { getGitHubUser } = await import('@/lib/github/client')
-        const { getMaxSandboxDuration } = await import('@/lib/db/settings')
-        const apiKeys = await getUserApiKeys()
-        const githubToken = await getUserGitHubToken()
-        const githubUser = await getGitHubUser()
-        const maxDurationSetting = await getMaxSandboxDuration(session.user.id)
-
-        if (task.selectedAgent === 'gateway') {
-          const { runPlannerPhase } = await import('@/lib/sandbox/orchestrator')
-          await runPlannerPhase(
-            taskId,
-            task.prompt,
-            task.repoUrl || '',
-            task.maxDuration || maxDurationSetting,
-            githubToken,
-            githubUser,
-            apiKeys,
-            task.branchName,
-          )
-        } else {
-          const { runTaskAsync } = await import('@/lib/sandbox/orchestrator')
-          await runTaskAsync(
-            taskId,
-            task.prompt,
-            task.repoUrl || '',
-            task.maxDuration || maxDurationSetting,
-            task.selectedAgent || 'gateway',
-            task.selectedModel || undefined,
-            task.installDependencies || false,
-            task.keepAlive || false,
-            task.enableBrowser || false,
-            apiKeys,
-            githubToken,
-            githubUser,
-            task.branchName,
-          )
-        }
-      } catch (error) {
-        console.error('Error retrying task:', error)
-      }
-    })
+    const runUrl = `${getAppUrl()}/api/internal/run-phase`
+    fetch(runUrl, {
+      method: 'POST',
+      headers: {
+        'content-type': 'application/json',
+        cookie: req.headers.get('cookie') || '',
+      },
+      body: JSON.stringify({ taskId, phase: 'planner' }),
+    }).catch((err) => console.error('Failed to trigger retry phase:', err))
 
     const [updated] = await db.select().from(tasks).where(eq(tasks.id, taskId)).limit(1)
     return NextResponse.json({ task: updated })
