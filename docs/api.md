@@ -144,9 +144,9 @@ Bulk hard-delete by status, scoped to the authenticated user.
 
 **Hobby async start** — creates the sandbox and kicks off execution. Fire-and-forget; the UI calls this immediately after `POST /api/tasks`.
 
-- Creates the sandbox via `createSandbox()`
-- Sets `task.status = 'processing'`, writes `sandboxId` and `sandboxUrl`
-- Calls `runTaskAsync()` (or `runPlannerPhase()` for gateway agent) via `runTaskAsync().catch()` (not `after()`)
+- Creates the sandbox via `provisionSandbox()` + `setupSandbox()`
+- Sets `task.status = 'processing'`, writes `sandboxId` immediately after the VM exists (before clone/install)
+- Calls `runTaskAsync()` (or `runPlannerPhase()` for gateway agent) via `after()`
 - Returns immediately with `{ task, message: 'Task started' }`
 
 For `gateway` agent tasks, `POST /api/tasks` already triggers `runPlannerPhase` via `after()`, so `/start` is primarily used by legacy agents and for retry scenarios.

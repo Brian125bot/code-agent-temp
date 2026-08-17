@@ -110,18 +110,24 @@ app/tasks/[taskId]/page.tsx (SSR wrapper)
 ## Sandbox Lifecycle
 
 ```
-createSandbox()
+provisionSandbox()
+  ├─ Sandbox.create (bounded: SANDBOX_CREATE_TIMEOUT_MS, default 9s; SANDBOX_CREATE_RETRIES, default 2)
+  ├─ registerSandbox()
+  └─ persist tasks.sandboxId immediately (before any clone/install)
+setupSandbox()
   ├─ git clone --depth 1 <repo> → /vercel/sandbox/project
   ├─ checkout branch (fallback nanoid, may upgrade to AI-generated)
   ├─ optional: install dependencies
-  ├─ optional: start dev server (detected port)
-  ├─ execute agent (Gateway CLI or AI SDK-based)
+  └─ optional: start dev server (detected port)
+execute agent (Gateway CLI or AI SDK-based)
   ├─ agent edits files, runs commands, tests
   ├─ pushChangesToBranch() → git add → git commit → git push origin <branch>
   ├─ optionally create PR via Octokit
   ├─ optionally generate audio summary
   └─ shutdownSandbox() (or keep alive if keepAlive=true)
 ```
+
+The create call is split from repo setup (`createSandbox()` = `provisionSandbox()` + `setupSandbox()`). `sandboxId` is written to the task row as soon as the VM exists, so healers/reapers never misclassify a live sandbox as a stuck task while clone/install are still running. Fire-and-forget triggers (`/start`, internal `run-phase`) use `after()` to keep the provisioning work alive after the HTTP response.
 
 Sandbox configuration (`lib/sandbox/types.ts`):
 

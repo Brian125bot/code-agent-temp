@@ -1,4 +1,4 @@
-import { NextRequest, NextResponse } from 'next/server'
+import { NextRequest, NextResponse, after } from 'next/server'
 import { db } from '@/lib/db/client'
 import { tasks } from '@/lib/db/schema'
 import { eq, and, isNull } from 'drizzle-orm'
@@ -41,21 +41,23 @@ export async function POST(_req: NextRequest, context: { params: Promise<{ taskI
     const effectiveAgent = (task.selectedAgent as string) || 'gateway'
     const effectiveModel = (task.gatewayModel as string) || (task.selectedModel as string) || undefined
 
-    runTaskAsync(
-      task.id,
-      task.prompt,
-      task.repoUrl || '',
-      (task.maxDuration as number) || maxSandboxDuration,
-      effectiveAgent,
-      effectiveModel,
-      Boolean(task.installDependencies),
-      Boolean(task.keepAlive),
-      Boolean(task.enableBrowser),
-      userApiKeys,
-      userGithubToken,
-      githubUser,
-      task.branchName as string | null,
-    ).catch((e) => console.error('runTaskAsync failed:', e))
+    after(() => {
+      runTaskAsync(
+        task.id,
+        task.prompt,
+        task.repoUrl || '',
+        (task.maxDuration as number) || maxSandboxDuration,
+        effectiveAgent,
+        effectiveModel,
+        Boolean(task.installDependencies),
+        Boolean(task.keepAlive),
+        Boolean(task.enableBrowser),
+        userApiKeys,
+        userGithubToken,
+        githubUser,
+        task.branchName as string | null,
+      ).catch((e) => console.error('runTaskAsync failed:', e))
+    })
 
     return NextResponse.json({ task: { ...task, status: 'processing' as const }, message: 'Task started' })
   } catch (error) {

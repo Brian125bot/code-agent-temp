@@ -48,6 +48,8 @@ This project uses environment variables for all configuration. Variables are cat
 | Variable                    | Default                | Meaning                                                                                                                                                              |
 | --------------------------- | ---------------------- | -------------------------------------------------------------------------------------------------------------------------------------------------------------------- |
 | `MAX_SANDBOX_DURATION`      | `60`                   | Sandbox VM lifetime in minutes (`lib/constants.ts`). Original template defaulted to `300`; trimmed for Vercel Hobby's 10-second function timeout.                    |
+| `SANDBOX_CREATE_TIMEOUT_MS` | `9000`                 | Hard limit on the Vercel Sandbox API create call, in milliseconds (`lib/sandbox/creation.ts`). Kept under the 10-second Hobby function limit.                        |
+| `SANDBOX_CREATE_RETRIES`    | `2`                    | Retries after a create timeout (`lib/sandbox/creation.ts`). Absorbs transient Vercel Sandbox API slowness.                                                          |
 | `MAX_MESSAGES_PER_DAY`      | `5`                    | Tasks + follow-ups per user per day (`lib/utils/rate-limit.ts`)                                                                                                      |
 | `NPM_TOKEN`                 | —                      | Private npm access token for sandboxed environments                                                                                                                  |
 | `GITHUB_WEBHOOK_SECRET`     | —                      | HMAC secret for verifying `POST /api/webhooks/github` payloads (`x-hub-signature-256`). If unset, signature verification is skipped (not recommended for production) |
@@ -84,6 +86,8 @@ AI_GATEWAY_API_KEY=your-gateway-key
 
 # ─── Optional ───
 MAX_SANDBOX_DURATION=60
+SANDBOX_CREATE_TIMEOUT_MS=9000
+SANDBOX_CREATE_RETRIES=2
 MAX_MESSAGES_PER_DAY=5
 GITHUB_WEBHOOK_SECRET=your-webhook-secret
 WEBHOOK_DEFAULT_USER_ID=your-default-user-id

@@ -9,11 +9,67 @@ import { TaskLogger } from '@/lib/utils/task-logger'
 import { detectPackageManager, installDependencies } from './package-manager'
 import { registerSandbox } from './sandbox-registry'
 
+const SANDBOX_CREATE_TIMEOUT_MS = (() => {
+  const parsed = parseInt(process.env.SANDBOX_CREATE_TIMEOUT_MS || '9000', 10)
+  return Number.isFinite(parsed) && parsed > 0 ? parsed : 9000
+})()
+
+const SANDBOX_CREATE_RETRIES = (() => {
+  const parsed = parseInt(process.env.SANDBOX_CREATE_RETRIES || '2', 10)
+  return Number.isFinite(parsed) && parsed >= 0 ? parsed : 2
+})()
+
 function withTimeout<T>(promise: Promise<T>, ms: number, label: string): Promise<T> {
   return Promise.race([
     promise,
     new Promise<T>((_, reject) => setTimeout(() => reject(new Error(`${label} timed out after ${ms}ms`)), ms)),
   ])
+}
+
+function isTimeoutError(error: unknown): boolean {
+  const errorMessage = error instanceof Error ? error.message : ''
+  const errorName = error instanceof Error ? error.name : 'UnknownError'
+  const errorCode =
+    error && typeof error === 'object' && 'code' in error ? (error as { code?: string }).code : undefined
+  return (
+    errorMessage.includes('timeout') ||
+    errorMessage.includes('timed out') ||
+    errorCode === 'ETIMEDOUT' ||
+    errorName === 'TimeoutError'
+  )
+}
+
+type SandboxCreateOptions = {
+  teamId: string
+  projectId: string
+  token: string
+  source?: {
+    type: 'git'
+    url: string
+    revision?: string
+    depth?: number
+  }
+  timeout: number
+  ports: number[]
+  runtime: string
+  resources: { vcpus: number }
+}
+
+export async function createSandboxVm(options: SandboxCreateOptions, logger: TaskLogger): Promise<Sandbox> {
+  let lastError: unknown
+  for (let attempt = 0; attempt <= SANDBOX_CREATE_RETRIES; attempt++) {
+    try {
+      return await withTimeout(Sandbox.create(options), SANDBOX_CREATE_TIMEOUT_MS, 'Sandbox.create')
+    } catch (error) {
+      lastError = error
+      if (!isTimeoutError(error) || attempt >= SANDBOX_CREATE_RETRIES) {
+        throw error
+      }
+      await logger.info('Sandbox create attempt timed out, retrying')
+      await new Promise((resolve) => setTimeout(resolve, 500 * (attempt + 1)))
+    }
+  }
+  throw lastError
 }
 
 // Helper function to run command and log it
@@ -51,7 +107,7 @@ async function runAndLogCommand(sandbox: Sandbox, command: string, args: string[
   return result
 }
 
-export async function createSandbox(config: SandboxConfig, logger: TaskLogger): Promise<SandboxResult> {
+export async function provisionSandbox(config: SandboxConfig, logger: TaskLogger): Promise<SandboxResult> {
   try {
     await logger.info('Processing repository URL')
 
@@ -74,7 +130,7 @@ export async function createSandbox(config: SandboxConfig, logger: TaskLogger): 
     await logger.info('Environment variables validated')
 
     // Handle private repository authentication
-    const authenticatedRepoUrl = createAuthenticatedRepoUrl(config.repoUrl, config.githubToken)
+    createAuthenticatedRepoUrl(config.repoUrl, config.githubToken)
     await logger.info('Added GitHub authentication to repository URL')
 
     // Use the specified timeout (maxDuration) for sandbox lifetime
@@ -86,7 +142,7 @@ export async function createSandbox(config: SandboxConfig, logger: TaskLogger): 
     const defaultPorts = config.ports || [3000, 5173]
 
     // Create sandbox without source - we'll clone manually to /vercel/sandbox/project
-    const sandboxConfig = {
+    const sandboxConfig: SandboxCreateOptions = {
       teamId: process.env.SANDBOX_VERCEL_TEAM_ID!,
       projectId: process.env.SANDBOX_VERCEL_PROJECT_ID!,
       token: process.env.SANDBOX_VERCEL_TOKEN!,
@@ -101,9 +157,8 @@ export async function createSandbox(config: SandboxConfig, logger: TaskLogger): 
       await config.onProgress(25, 'Validating configuration...')
     }
 
-    let sandbox: Sandbox
     try {
-      sandbox = await withTimeout(Sandbox.create(sandboxConfig), 8000, 'Sandbox.create')
+      const sandbox = await createSandboxVm(sandboxConfig, logger)
       await logger.info('Sandbox created successfully')
 
       // Register the sandbox immediately for potential killing
@@ -115,49 +170,17 @@ export async function createSandbox(config: SandboxConfig, logger: TaskLogger): 
         return { success: false, cancelled: true }
       }
 
-      // Clone repository to /vercel/sandbox/project
-      await logger.info('Cloning repository to project directory...')
-
-      // Create project directory
-      const mkdirResult = await runCommandInSandbox(sandbox, 'mkdir', ['-p', PROJECT_DIR])
-      if (!mkdirResult.success) {
-        throw new Error('Failed to create project directory')
-      }
-
-      // Clone the repository with shallow clone
-      const cloneResult = await runCommandInSandbox(sandbox, 'git', [
-        'clone',
-        '--depth',
-        '1',
-        authenticatedRepoUrl,
-        PROJECT_DIR,
-      ])
-
-      if (!cloneResult.success) {
-        await logger.error('Failed to clone repository')
-        throw new Error('Failed to clone repository to project directory')
-      }
-
-      await logger.info('Repository cloned successfully')
-
-      // Call progress callback after sandbox creation
-      if (config.onProgress) {
-        await config.onProgress(30, 'Repository cloned, installing dependencies...')
-      }
+      return { success: true, sandbox }
     } catch (error: unknown) {
-      const errorMessage = error instanceof Error ? error.message : 'Unknown error occurred'
-      const errorName = error instanceof Error ? error.name : 'UnknownError'
-      const errorCode =
-        error && typeof error === 'object' && 'code' in error ? (error as { code?: string }).code : undefined
       const errorResponse =
         error && typeof error === 'object' && 'response' in error
           ? (error as { response?: { status?: number; data?: unknown } }).response
           : undefined
 
       // Check if this is a timeout error
-      if (errorMessage?.includes('timeout') || errorCode === 'ETIMEDOUT' || errorName === 'TimeoutError') {
+      if (isTimeoutError(error)) {
         await logger.error('Sandbox creation timed out')
-        await logger.error('This usually happens when the repository is large or has many dependencies')
+        await logger.error('The sandbox provider did not respond in time, please retry')
         throw new Error('Sandbox creation timed out, please retry')
       }
 
@@ -167,6 +190,55 @@ export async function createSandbox(config: SandboxConfig, logger: TaskLogger): 
         await logger.error('Error response received')
       }
       throw error
+    }
+  } catch (error: unknown) {
+    const errorMessage = error instanceof Error ? error.message : 'Unknown error occurred'
+    console.error('Sandbox provisioning error:', error)
+    await logger.error('Error occurred during sandbox provisioning')
+
+    return {
+      success: false,
+      error: errorMessage || 'Failed to create sandbox',
+    }
+  }
+}
+
+export async function setupSandbox(
+  sandbox: Sandbox,
+  config: SandboxConfig,
+  logger: TaskLogger,
+): Promise<SandboxResult> {
+  try {
+    const authenticatedRepoUrl = createAuthenticatedRepoUrl(config.repoUrl, config.githubToken)
+
+    // Clone repository to /vercel/sandbox/project
+    await logger.info('Cloning repository to project directory...')
+
+    // Create project directory
+    const mkdirResult = await runCommandInSandbox(sandbox, 'mkdir', ['-p', PROJECT_DIR])
+    if (!mkdirResult.success) {
+      throw new Error('Failed to create project directory')
+    }
+
+    // Clone the repository with shallow clone
+    const cloneResult = await runCommandInSandbox(sandbox, 'git', [
+      'clone',
+      '--depth',
+      '1',
+      authenticatedRepoUrl,
+      PROJECT_DIR,
+    ])
+
+    if (!cloneResult.success) {
+      await logger.error('Failed to clone repository')
+      throw new Error('Failed to clone repository to project directory')
+    }
+
+    await logger.info('Repository cloned successfully')
+
+    // Call progress callback after sandbox creation
+    if (config.onProgress) {
+      await config.onProgress(30, 'Repository cloned, installing dependencies...')
     }
 
     // Install project dependencies (based on user preference)
@@ -992,12 +1064,20 @@ SKILL_EOF`
     }
   } catch (error: unknown) {
     const errorMessage = error instanceof Error ? error.message : 'Unknown error occurred'
-    console.error('Sandbox creation error:', error)
-    await logger.error('Error occurred during sandbox creation')
+    console.error('Sandbox setup error:', error)
+    await logger.error('Error occurred during sandbox setup')
 
     return {
       success: false,
-      error: errorMessage || 'Failed to create sandbox',
+      error: errorMessage || 'Failed to set up sandbox',
     }
   }
+}
+
+export async function createSandbox(config: SandboxConfig, logger: TaskLogger): Promise<SandboxResult> {
+  const provisionResult = await provisionSandbox(config, logger)
+  if (!provisionResult.success || !provisionResult.sandbox) {
+    return provisionResult
+  }
+  return setupSandbox(provisionResult.sandbox, config, logger)
 }

@@ -578,6 +578,7 @@ public/, scripts/, opensrc/, docs/
 
 - **`AI_GATEWAY_API_KEY is required`** — set it globally (`AI_GATEWAY_API_KEY=vck_...`) or per-user in the profile API Keys dialog (Gateway). Without it, branch/title/commit fall back to timestamps, then to agent failure (correct — every inference path requires Gateway).
 - **Bonded 10s timeout on `/start`** — `POST /api/tasks/[taskId]/start` is capped at 10s. It creates the Sandbox and spawns the agent, then returns immediately; agent execution continues inside the VM. Do not re-introduce `after()`-forever in this path.
+- **"Sandbox creation timed out, please retry"** — the Vercel Sandbox API create call has a bounded timeout (default 9s, up to 2 retries, configurable via `SANDBOX_CREATE_TIMEOUT_MS` / `SANDBOX_CREATE_RETRIES`). The VM ID is persisted to the task as soon as the sandbox exists, so a slow provision no longer leaves tasks stuck in `processing` without a sandbox.
 - **Private repo clone fails** — ensure the user connected GitHub (`POST /api/auth/signin/github` or profile Connect) so `getUserGitHubToken()` can supply an authenticated clone URL.
 - **Vite preview blocked** — `creation.ts` sets `vite.config.* → host: true` and adds it to `~/.gitignore_global`.
 - **DB drift** — run `pnpm db:generate` then `pnpm db:push`. Never hand-edit tables outside Drizzle.

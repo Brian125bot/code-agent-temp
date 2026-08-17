@@ -12,6 +12,7 @@ import { detectPackageManager, installDependencies } from '@/lib/sandbox/package
 import { createTaskLogger } from '@/lib/utils/task-logger'
 import { getMaxSandboxDuration } from '@/lib/db/settings'
 import { detectPortFromRepo } from '@/lib/sandbox/port-detection'
+import { createSandboxVm } from '@/lib/sandbox/creation'
 
 export async function POST(_request: NextRequest, { params }: { params: Promise<{ taskId: string }> }) {
   try {
@@ -88,30 +89,43 @@ export async function POST(_request: NextRequest, { params }: { params: Promise<
     console.log(`Detected port ${port} for project`)
 
     // Create a new sandbox by cloning the repo
-    const sandbox = await Sandbox.create({
-      teamId: process.env.SANDBOX_VERCEL_TEAM_ID!,
-      projectId: process.env.SANDBOX_VERCEL_PROJECT_ID!,
-      token: process.env.SANDBOX_VERCEL_TOKEN!,
-      source:
-        task.repoUrl && task.branchName
-          ? {
-              type: 'git' as const,
-              url: task.repoUrl,
-              revision: task.branchName,
-              depth: 1,
-            }
-          : undefined,
-      timeout: maxDurationMinutes * 60 * 1000, // Convert minutes to milliseconds
-      ports: [port],
-      runtime: 'node22',
-      resources: { vcpus: 4 },
-    })
+    const sandbox = await createSandboxVm(
+      {
+        teamId: process.env.SANDBOX_VERCEL_TEAM_ID!,
+        projectId: process.env.SANDBOX_VERCEL_PROJECT_ID!,
+        token: process.env.SANDBOX_VERCEL_TOKEN!,
+        source:
+          task.repoUrl && task.branchName
+            ? {
+                type: 'git',
+                url: task.repoUrl,
+                revision: task.branchName,
+                depth: 1,
+              }
+            : undefined,
+        timeout: maxDurationMinutes * 60 * 1000, // Convert minutes to milliseconds
+        ports: [port],
+        runtime: 'node22',
+        resources: { vcpus: 2 },
+      },
+      logger,
+    )
 
     const sandboxId = sandbox?.sandboxId
     await logger.info('Sandbox created')
 
     // Register the sandbox
     registerSandbox(taskId, sandbox)
+
+    // Persist the sandbox ID as soon as the VM exists so healers and reapers
+    // never misclassify a live sandbox as a stuck task.
+    await db
+      .update(tasks)
+      .set({
+        sandboxId,
+        updatedAt: new Date(),
+      })
+      .where(eq(tasks.id, taskId))
 
     // Configure Git user
     await logger.info('Configuring Git')

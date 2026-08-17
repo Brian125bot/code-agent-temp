@@ -4,7 +4,7 @@ import { tasks, taskMessages, connectors } from '@/lib/db/schema'
 import { eq, and, asc } from 'drizzle-orm'
 import { generateId } from '@/lib/utils/id'
 import { createTaskLogger } from '@/lib/utils/task-logger'
-import { createSandbox } from '@/lib/sandbox/creation'
+import { provisionSandbox, setupSandbox } from '@/lib/sandbox/creation'
 import { executeAgentInSandbox, AgentType } from '@/lib/sandbox/agents'
 import { pushChangesToBranch, shutdownSandbox } from '@/lib/sandbox/git'
 import { unregisterSandbox } from '@/lib/sandbox/sandbox-registry'
@@ -92,43 +92,56 @@ export async function continueTask(
       const port = await detectPortFromRepo(repoUrl, githubToken)
       console.log(`Detected port ${port} for project`)
 
-      const sandboxResult = await createSandbox(
-        {
-          taskId,
-          repoUrl,
-          githubToken,
-          gitAuthorName: githubUser?.name || githubUser?.username || 'Coding Agent',
-          gitAuthorEmail: githubUser?.username
-            ? `${githubUser.username}@users.noreply.github.com`
-            : 'agent@example.com',
-          apiKeys,
-          timeout: `${maxDuration}m`,
-          ports: [port],
-          runtime: 'node22',
-          resources: { vcpus: 4 },
-          taskPrompt: prompt,
-          selectedAgent,
-          selectedModel,
-          installDependencies,
-          preDeterminedBranchName: branchName,
-          onProgress: async (progress: number, message: string) => {
-            await logger.updateProgress(progress, message)
-          },
+      const sandboxConfig = {
+        taskId,
+        repoUrl,
+        githubToken,
+        gitAuthorName: githubUser?.name || githubUser?.username || 'Coding Agent',
+        gitAuthorEmail: githubUser?.username ? `${githubUser.username}@users.noreply.github.com` : 'agent@example.com',
+        apiKeys,
+        timeout: `${maxDuration}m`,
+        ports: [port],
+        runtime: 'node22',
+        resources: { vcpus: 4 },
+        taskPrompt: prompt,
+        selectedAgent,
+        selectedModel,
+        installDependencies,
+        preDeterminedBranchName: branchName,
+        onProgress: async (progress: number, message: string) => {
+          await logger.updateProgress(progress, message)
         },
-        logger,
-      )
-
-      if (!sandboxResult.success) {
-        throw new Error(sandboxResult.error || 'Failed to create sandbox')
       }
 
-      const { sandbox: createdSandbox, domain } = sandboxResult
-      sandbox = createdSandbox || null
+      const provisionResult = await provisionSandbox(sandboxConfig, logger)
+
+      if (!provisionResult.success || !provisionResult.sandbox) {
+        throw new Error(provisionResult.error || 'Failed to create sandbox')
+      }
+
+      sandbox = provisionResult.sandbox
+
+      // Persist the sandbox ID as soon as the VM exists so healers and
+      // reapers never misclassify a live sandbox as a stuck task.
+      await db
+        .update(tasks)
+        .set({
+          sandboxId: sandbox.sandboxId,
+          updatedAt: new Date(),
+        })
+        .where(eq(tasks.id, taskId))
+
+      const setupResult = await setupSandbox(sandbox, sandboxConfig, logger)
+
+      if (!setupResult.success) {
+        throw new Error(setupResult.error || 'Failed to set up sandbox')
+      }
+
+      const { domain } = setupResult
 
       await db
         .update(tasks)
         .set({
-          sandboxId: sandbox?.sandboxId || undefined,
           sandboxUrl: domain || undefined,
           updatedAt: new Date(),
         })

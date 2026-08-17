@@ -1,13 +1,14 @@
 import { eq } from 'drizzle-orm'
 import { db } from '@/lib/db/client'
 import { tasks, connectors, taskMessages, plans } from '@/lib/db/schema'
-import { createSandbox } from './creation'
+import { provisionSandbox, setupSandbox } from './creation'
+import { SandboxConfig, SandboxResult } from './types'
 import { executeAgentInSandbox, AgentType } from './agents'
 import { pushChangesToBranch, shutdownSandbox } from './git'
 import { unregisterSandbox } from './sandbox-registry'
 import { decrypt } from '@/lib/crypto'
 import { getServerSession } from '@/lib/session/get-server-session'
-import { createTaskLogger } from '@/lib/utils/task-logger'
+import { createTaskLogger, TaskLogger } from '@/lib/utils/task-logger'
 import { generateCommitMessage, createFallbackCommitMessage } from '@/lib/utils/commit-message-generator'
 import { detectPortFromRepo } from './port-detection'
 import { generateId } from '@/lib/utils/id'
@@ -21,6 +22,82 @@ async function isTaskStopped(taskId: string): Promise<boolean> {
   } catch {
     return false
   }
+}
+
+type SandboxRuntimeParams = {
+  repoUrl: string
+  githubToken: string | null | undefined
+  githubUser: { username: string; name: string | null; email: string | null } | null | undefined
+  apiKeys: {
+    AI_GATEWAY_API_KEY?: string
+    OPENAI_API_KEY?: string
+    GEMINI_API_KEY?: string
+    CURSOR_API_KEY?: string
+    ANTHROPIC_API_KEY?: string
+  }
+  timeout: string
+  taskPrompt: string
+  selectedAgent: string
+  selectedModel?: string
+  installDependencies: boolean
+  keepAlive: boolean
+  enableBrowser: boolean
+  preDeterminedBranchName?: string
+}
+
+async function provisionAndSetup(
+  taskId: string,
+  params: SandboxRuntimeParams,
+  port: number,
+  logger: TaskLogger,
+): Promise<SandboxResult> {
+  const sandboxConfig: SandboxConfig = {
+    taskId,
+    repoUrl: params.repoUrl,
+    githubToken: params.githubToken,
+    gitAuthorName: params.githubUser?.name || params.githubUser?.username || 'Coding Agent',
+    gitAuthorEmail: params.githubUser?.username
+      ? `${params.githubUser.username}@users.noreply.github.com`
+      : 'agent@example.com',
+    apiKeys: params.apiKeys,
+    timeout: params.timeout,
+    ports: [port],
+    runtime: 'node22',
+    resources: { vcpus: 2 },
+    taskPrompt: params.taskPrompt,
+    selectedAgent: params.selectedAgent,
+    selectedModel: params.selectedModel,
+    installDependencies: params.installDependencies,
+    keepAlive: params.keepAlive,
+    enableBrowser: params.enableBrowser,
+    preDeterminedBranchName: params.preDeterminedBranchName,
+    onProgress: async (progress: number, message: string) => {
+      await logger.updateProgress(progress, message)
+    },
+    onCancellationCheck: async () => await isTaskStopped(taskId),
+  }
+
+  const provisionResult = await provisionSandbox(sandboxConfig, logger)
+  if (!provisionResult.success || !provisionResult.sandbox) {
+    return provisionResult
+  }
+
+  // Persist the sandbox ID as soon as the VM exists so healers and reapers
+  // never misclassify a live sandbox as a stuck task.
+  await db
+    .update(tasks)
+    .set({ sandboxId: provisionResult.sandbox.sandboxId, updatedAt: new Date() })
+    .where(eq(tasks.id, taskId))
+
+  if (await isTaskStopped(taskId)) {
+    await logger.info('Task was stopped after sandbox creation')
+    try {
+      await shutdownSandbox(provisionResult.sandbox)
+    } catch {}
+    return { success: false, cancelled: true }
+  }
+
+  return setupSandbox(provisionResult.sandbox, sandboxConfig, logger)
 }
 
 export async function runPlannerPhase(
@@ -54,18 +131,14 @@ export async function runPlannerPhase(
     const port = await detectPortFromRepo(repoUrl, githubToken)
     await logger.updateProgress(15, 'Creating sandbox environment')
 
-    const sandboxResult = await createSandbox(
+    const sandboxResult = await provisionAndSetup(
+      taskId,
       {
-        taskId,
         repoUrl,
         githubToken,
-        gitAuthorName: githubUser?.name || githubUser?.username || 'Coding Agent',
-        gitAuthorEmail: githubUser?.username ? `${githubUser.username}@users.noreply.github.com` : 'agent@example.com',
+        githubUser,
         apiKeys,
         timeout: `${Math.min(maxDuration, 5)}m`,
-        ports: [port],
-        runtime: 'node22',
-        resources: { vcpus: 2 },
         taskPrompt: prompt,
         selectedAgent: 'gateway',
         selectedModel: undefined,
@@ -73,11 +146,8 @@ export async function runPlannerPhase(
         keepAlive: false,
         enableBrowser: false,
         preDeterminedBranchName: branchName || undefined,
-        onProgress: async (progress: number, message: string) => {
-          await logger.updateProgress(progress, message)
-        },
-        onCancellationCheck: async () => await isTaskStopped(taskId),
       },
+      port,
       logger,
     )
 
@@ -194,18 +264,14 @@ export async function runExecutionPhase(taskId: string) {
     const port = await detectPortFromRepo(repoUrl, githubToken)
     await logger.updateProgress(15, 'Creating sandbox environment')
 
-    const sandboxResult = await createSandbox(
+    const sandboxResult = await provisionAndSetup(
+      taskId,
       {
-        taskId,
         repoUrl,
         githubToken,
-        gitAuthorName: githubUser?.name || githubUser?.username || 'Coding Agent',
-        gitAuthorEmail: githubUser?.username ? `${githubUser.username}@users.noreply.github.com` : 'agent@example.com',
+        githubUser,
         apiKeys,
         timeout: `${maxDuration}m`,
-        ports: [port],
-        runtime: 'node22',
-        resources: { vcpus: 2 },
         taskPrompt: prompt,
         selectedAgent,
         selectedModel,
@@ -213,11 +279,8 @@ export async function runExecutionPhase(taskId: string) {
         keepAlive: task.keepAlive || false,
         enableBrowser: task.enableBrowser || false,
         preDeterminedBranchName: branchName || undefined,
-        onProgress: async (progress: number, message: string) => {
-          await logger.updateProgress(progress, message)
-        },
-        onCancellationCheck: async () => await isTaskStopped(taskId),
       },
+      port,
       logger,
     )
 
@@ -477,18 +540,14 @@ export async function runTaskAsync(
     const port = await detectPortFromRepo(repoUrl, githubToken)
     await logger.updateProgress(15, 'Creating sandbox environment')
 
-    const sandboxResult = await createSandbox(
+    const sandboxResult = await provisionAndSetup(
+      taskId,
       {
-        taskId,
         repoUrl,
         githubToken,
-        gitAuthorName: githubUser?.name || githubUser?.username || 'Coding Agent',
-        gitAuthorEmail: githubUser?.username ? `${githubUser.username}@users.noreply.github.com` : 'agent@example.com',
+        githubUser,
         apiKeys,
         timeout: `${maxDuration}m`,
-        ports: [port],
-        runtime: 'node22',
-        resources: { vcpus: 2 },
         taskPrompt: prompt,
         selectedAgent,
         selectedModel,
@@ -496,11 +555,8 @@ export async function runTaskAsync(
         keepAlive,
         enableBrowser,
         preDeterminedBranchName: branchName || undefined,
-        onProgress: async (progress: number, message: string) => {
-          await logger.updateProgress(progress, message)
-        },
-        onCancellationCheck: async () => await isTaskStopped(taskId),
       },
+      port,
       logger,
     )
 

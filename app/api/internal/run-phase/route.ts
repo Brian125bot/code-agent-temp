@@ -1,4 +1,4 @@
-import { NextRequest, NextResponse } from 'next/server'
+import { NextRequest, NextResponse, after } from 'next/server'
 import { db } from '@/lib/db/client'
 import { tasks, taskMessages } from '@/lib/db/schema'
 import { eq, and, isNull, desc } from 'drizzle-orm'
@@ -61,27 +61,31 @@ export async function POST(req: NextRequest) {
         const githubUser = await getGitHubUser()
         const maxDuration = await getMaxSandboxDuration(task.userId)
         const { runTaskAsync } = await import('@/lib/sandbox/orchestrator')
-        runTaskAsync(
-          taskId,
-          task.prompt,
-          task.repoUrl || '',
-          (task.maxDuration as number) || maxDuration,
-          (task.selectedAgent as string) || 'gateway',
-          (task.selectedModel as string) || undefined,
-          Boolean(task.installDependencies),
-          Boolean(task.keepAlive),
-          Boolean(task.enableBrowser),
-          apiKeys,
-          githubToken,
-          githubUser,
-          task.branchName as string | null,
-        ).catch((e) => console.error('runTaskAsync failed:', e))
+        after(() => {
+          runTaskAsync(
+            taskId,
+            task.prompt,
+            task.repoUrl || '',
+            (task.maxDuration as number) || maxDuration,
+            (task.selectedAgent as string) || 'gateway',
+            (task.selectedModel as string) || undefined,
+            Boolean(task.installDependencies),
+            Boolean(task.keepAlive),
+            Boolean(task.enableBrowser),
+            apiKeys,
+            githubToken,
+            githubUser,
+            task.branchName as string | null,
+          ).catch((e) => console.error('runTaskAsync failed:', e))
+        })
         break
       }
 
       case 'execution': {
         const { runExecutionPhase } = await import('@/lib/sandbox/orchestrator')
-        runExecutionPhase(taskId).catch((e) => console.error('runExecutionPhase failed:', e))
+        after(() => {
+          runExecutionPhase(taskId).catch((e) => console.error('runExecutionPhase failed:', e))
+        })
         break
       }
 
@@ -102,25 +106,29 @@ export async function POST(req: NextRequest) {
         const githubUser = await getGitHubUser()
         const maxDuration = await getMaxSandboxDuration(task.userId)
         const { continueTask } = await import('@/lib/sandbox/continue-task')
-        continueTask(
-          taskId,
-          latestMessage.content,
-          task.repoUrl || '',
-          task.branchName || '',
-          (task.maxDuration as number) || maxDuration,
-          (task.selectedAgent as string) || 'claude',
-          (task.selectedModel as string) || undefined,
-          Boolean(task.installDependencies),
-          apiKeys,
-          githubToken,
-          githubUser,
-        ).catch((e) => console.error('continueTask failed:', e))
+        after(() => {
+          continueTask(
+            taskId,
+            latestMessage.content,
+            task.repoUrl || '',
+            task.branchName || '',
+            (task.maxDuration as number) || maxDuration,
+            (task.selectedAgent as string) || 'claude',
+            (task.selectedModel as string) || undefined,
+            Boolean(task.installDependencies),
+            apiKeys,
+            githubToken,
+            githubUser,
+          ).catch((e) => console.error('continueTask failed:', e))
+        })
         break
       }
 
       case 'audio': {
         const { generateAudioSummary } = await import('@/lib/audio/generate-summary')
-        generateAudioSummary(taskId).catch((e) => console.error('generateAudioSummary failed:', e))
+        after(() => {
+          generateAudioSummary(taskId).catch((e) => console.error('generateAudioSummary failed:', e))
+        })
         break
       }
     }
